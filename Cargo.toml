@@ -1,0 +1,7 @@
+[workspace]
+
+members = [
+  "gd32vf103xx-hal",
+  "longan-nano",
+  "telemetry"
+]
