@@ -9,7 +9,7 @@ pub use gd32vf103xx_hal as hal;
 #[cfg_attr(docsrs, doc(cfg(feature = "lcd")))]
 pub mod lcd;
 pub mod led;
-pub mod stdout;
 #[cfg(feature = "sdcard")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sdcard")))]
 pub mod sdcard;
+pub mod stdout;

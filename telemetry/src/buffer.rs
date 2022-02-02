@@ -28,7 +28,7 @@ impl<'a> Buffer<'a> {
         self.cursor
     }
 
-    pub fn empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.cursor == 0
     }
 

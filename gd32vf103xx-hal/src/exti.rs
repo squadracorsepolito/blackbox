@@ -17,7 +17,7 @@ pub enum InternalLine {
 
 /// Enable/Disable event genration to wakeup unit for an EXTI line
 #[derive(Copy, Clone)]
-pub enum ExtiEvent{
+pub enum ExtiEvent {
     Enable,
     Disable,
 }
@@ -79,11 +79,11 @@ impl Exti {
                 TriggerEdge::Falling => {
                     self.raw.ften.modify(|r, w| w.bits(r.bits() | bm));
                     self.raw.rten.modify(|r, w| w.bits(r.bits() & !bm));
-                },
+                }
                 TriggerEdge::Rising => {
                     self.raw.ften.modify(|r, w| w.bits(r.bits() & !bm));
                     self.raw.rten.modify(|r, w| w.bits(r.bits() | bm));
-                },
+                }
                 TriggerEdge::Both => {
                     self.raw.ften.modify(|r, w| w.bits(r.bits() | bm));
                     self.raw.rten.modify(|r, w| w.bits(r.bits() | bm));

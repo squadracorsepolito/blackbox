@@ -73,27 +73,43 @@ pub enum FIFO {
     FIFO1,
 }
 
-pub mod filter {
-    use super::FIFO;
+#[repr(u8)]
+pub enum Interrupt {
+    TMEIE,
+    RFNEIE0,
+    RFFIE0,
+    RFOIE0,
+    RFNEIE1,
+    RFFIE1,
+    RFOIE1,
+    WERRIE = 8,
+    PERRIE,
+    BOIE,
+    ERRNIE,
+    ERRIE = 15,
+    WIE,
+    SLPWIE
+}
 
-    pub enum FilterMode {
-        List,
-        Mask,
-    }
-
+mod filter_banks {
     pub const CAN0: u8 = 0;
     pub const CAN1: u8 = 15;
+}
 
-    pub enum FilterEntry {
-        Entry32([u32; 2]),
-        Entry16([u16; 4]),
-    }
+pub enum FilterMode {
+    List,
+    Mask,
+}
 
-    pub struct Filter {
-        pub entry: FilterEntry,
-        pub mode: FilterMode,
-        pub fifo_index: FIFO,
-    }
+pub enum FilterEntry {
+    Entry32([u32; 2]),
+    Entry16([u16; 4]),
+}
+
+pub struct Filter {
+    pub entry: FilterEntry,
+    pub mode: FilterMode,
+    pub fifo_index: FIFO,
 }
 
 pub trait Pins<CAN, REMAP> {
@@ -141,16 +157,14 @@ pub struct Can<CAN, REMAP> {
 
 macro_rules! can {
     ($CAN:ident) => {
-        impl<REMAP: Into<u8> + Into<bool>> Can<$CAN, REMAP>
-        {
-
+        impl<REMAP: Into<u8> + Into<bool>> Can<$CAN, REMAP> {
             pub fn new(
                 can: $CAN,
                 pins: impl Pins<$CAN, REMAP>,
                 config: Config,
                 afio: &mut Afio,
-                rcu: &mut Rcu
-                ) -> Self {
+                rcu: &mut Rcu,
+            ) -> Self {
                 $CAN::remap(afio, pins.remap().into());
 
                 $CAN::enable(rcu);
@@ -168,24 +182,34 @@ macro_rules! can {
                 }
 
                 can.bt.modify(|_, w| unsafe {
-                    w
-                        .scmod().bit(config.silent_communication)
-                        .lcmod().bit(config.loopback_communication)
-                        .sjw().bits(config.resync_jump_width.0)
-                        .bs1().bits(config.time_segment_1.0)
-                        .bs2().bits(config.time_segment_2.0)
-                        .baudpsc().bits(config.prescaler - 1)
+                    w.scmod()
+                        .bit(config.silent_communication)
+                        .lcmod()
+                        .bit(config.loopback_communication)
+                        .sjw()
+                        .bits(config.resync_jump_width.0)
+                        .bs1()
+                        .bits(config.time_segment_1.0)
+                        .bs2()
+                        .bits(config.time_segment_2.0)
+                        .baudpsc()
+                        .bits(config.prescaler - 1)
                 });
 
-                can.ctl.modify(|_, w|
-                               w
-                               .ttc().bit(config.time_triggered_communication)
-                               .abor().bit(config.auto_bus_off_recovery)
-                               .awu().bit(config.auto_wake_up)
-                               .ard().bit(!config.auto_retransmission)
-                               .rfod().bit(!config.receive_fifo_overwrite)
-                               .tfo().bit(config.trans_fifo_order)
-                );
+                can.ctl.modify(|_, w| {
+                    w.ttc()
+                        .bit(config.time_triggered_communication)
+                        .abor()
+                        .bit(config.auto_bus_off_recovery)
+                        .awu()
+                        .bit(config.auto_wake_up)
+                        .ard()
+                        .bit(!config.auto_retransmission)
+                        .rfod()
+                        .bit(!config.receive_fifo_overwrite)
+                        .tfo()
+                        .bit(config.trans_fifo_order)
+                });
 
                 // Disable initial working mode
                 can.ctl.modify(|_, w| w.iwmod().clear_bit());
@@ -201,16 +225,33 @@ macro_rules! can {
                 }
             }
 
+            pub fn enable_interrupt(self: &mut Self, index: Interrupt) {
+                let index_bit = 1 << index as u8;
+                self.can
+                    .inten
+                    .modify(|r, w| unsafe { w.bits(r.bits() | index_bit) });
+            }
+
+            pub fn disable_interrupt(self: &mut Self, index: Interrupt) {
+                let index_bit = 1 << index as u8;
+                self.can
+                    .inten
+                    .modify(|r, w| unsafe { w.bits(r.bits() & !index_bit) });
+            }
+
             pub fn transmit(self: &mut Self, frame: &Frame) -> nb::Result<(), Error> {
                 self.transmit_mailbox(MailBox::MailBox0, &frame)
                     .or(self.transmit_mailbox(MailBox::MailBox1, &frame))
                     .or(self.transmit_mailbox(MailBox::MailBox2, &frame))
             }
 
-            pub fn transmit_mailbox(self: &mut Self, mailbox: MailBox, frame: &Frame) -> nb::Result<(), Error> {
+            pub fn transmit_mailbox(
+                self: &mut Self,
+                mailbox: MailBox,
+                frame: &Frame,
+            ) -> nb::Result<(), Error> {
                 macro_rules! transmit {
                     ($tme:ident, $tmi:ident, $tmp:ident, $tmdata0:ident, $tmdata1:ident) => {{
-
                         // Transmit mailbox empty
                         if !self.can.tstat.read().$tme().bits() {
                             return Err(nb::Error::WouldBlock);
@@ -222,44 +263,57 @@ macro_rules! can {
                         match frame.id {
                             Id::Standard(id) => {
                                 self.can.$tmi.modify(|_, w| unsafe {
-                                    w
-                                        .sfid_efid().bits(id.as_raw())
-                                        .ff().clear_bit()
-                                        .ft().bit(frame.ft)
+                                    w.sfid_efid()
+                                        .bits(id.as_raw())
+                                        .ff()
+                                        .clear_bit()
+                                        .ft()
+                                        .bit(frame.ft)
                                 });
-                            },
+                            }
                             Id::Extended(id) => {
                                 self.can.$tmi.modify(|_, w| unsafe {
-                                    w
-                                        .sfid_efid().bits((id.as_raw() >> 18) as u16)
-                                        .efid().bits(id.as_raw())
-                                        .ff().set_bit()
-                                        .ft().bit(frame.ft)
+                                    w.sfid_efid()
+                                        .bits((id.as_raw() >> 18) as u16)
+                                        .efid()
+                                        .bits(id.as_raw())
+                                        .ff()
+                                        .set_bit()
+                                        .ft()
+                                        .bit(frame.ft)
                                 });
                             }
                         }
 
-                        self.can.$tmp.modify(|_, w| unsafe { w.dlenc().bits(frame.dlen) });
+                        self.can
+                            .$tmp
+                            .modify(|_, w| unsafe { w.dlenc().bits(frame.dlen) });
                         self.can.$tmdata0.write(|w| unsafe {
-                            w
-                                .db0().bits(frame.data[0])
-                                .db1().bits(frame.data[1])
-                                .db2().bits(frame.data[2])
-                                .db3().bits(frame.data[3])
+                            w.db0()
+                                .bits(frame.data[0])
+                                .db1()
+                                .bits(frame.data[1])
+                                .db2()
+                                .bits(frame.data[2])
+                                .db3()
+                                .bits(frame.data[3])
                         });
                         self.can.$tmdata1.write(|w| unsafe {
-                            w
-                                .db4().bits(frame.data[4])
-                                .db5().bits(frame.data[5])
-                                .db6().bits(frame.data[6])
-                                .db7().bits(frame.data[7])
+                            w.db4()
+                                .bits(frame.data[4])
+                                .db5()
+                                .bits(frame.data[5])
+                                .db6()
+                                .bits(frame.data[6])
+                                .db7()
+                                .bits(frame.data[7])
                         });
 
                         // Enable transmit
                         self.can.$tmi.modify(|_, w| w.ten().set_bit());
 
                         Ok(())
-                    }}
+                    }};
                 }
 
                 match mailbox {
@@ -282,18 +336,16 @@ macro_rules! can {
                             return Err(nb::Error::WouldBlock);
                         }
 
-                        let id =
-                            if self.can.$rfifomi.read().ff().bits() {
-                                let sfid_efid = self.can.$rfifomi.read().sfid_efid().bits() as u32;
-                                let efid = self.can.$rfifomi.read().efid().bits() as u32;
+                        let id = if self.can.$rfifomi.read().ff().bits() {
+                            let sfid_efid = self.can.$rfifomi.read().sfid_efid().bits() as u32;
+                            let efid = self.can.$rfifomi.read().efid().bits() as u32;
 
-                                Id::Extended(ExtendedId::new(sfid_efid << 18 | efid).unwrap())
-                            }
-                            else {
-                                let sfid = self.can.$rfifomi.read().sfid_efid().bits() as u16;
+                            Id::Extended(ExtendedId::new(sfid_efid << 18 | efid).unwrap())
+                        } else {
+                            let sfid = self.can.$rfifomi.read().sfid_efid().bits() as u16;
 
-                                Id::Standard(StandardId::new(sfid).unwrap())
-                            };
+                            Id::Standard(StandardId::new(sfid).unwrap())
+                        };
 
                         let frame = Frame {
                             id: id,
@@ -315,7 +367,7 @@ macro_rules! can {
                         self.can.$rfifo.modify(|_, w| w.$rfd().set_bit());
 
                         Ok(frame)
-                    }}
+                    }};
                 }
 
                 match fifo {
@@ -325,9 +377,9 @@ macro_rules! can {
             }
 
             pub fn enable_filter(index: u8, enable: bool) {
-                let index_bit = 1 << (filter::$CAN + index);
+                let index_bit = 1 << (filter_banks::$CAN + index);
 
-                let can = unsafe { &*CAN0::ptr() };
+                let can = unsafe { &*$CAN::ptr() };
 
                 // Disable filter lock
                 can.fctl.modify(|_, w| w.fld().set_bit());
@@ -345,10 +397,10 @@ macro_rules! can {
                 can.fctl.modify(|_, w| w.fld().clear_bit());
             }
 
-            pub fn set_filter(self: &mut Self, index: u8, filter: filter::Filter) {
-                let index_bit = 1 << (filter::$CAN + index);
+            pub fn set_filter(self: &mut Self, index: u8, filter: Filter) {
+                let index_bit = 1 << (filter_banks::$CAN + index);
 
-                let can = unsafe { &*CAN0::ptr() };
+                let can = unsafe { &*$CAN::ptr() };
 
                 // Disable filter lock
                 can.fctl.modify(|_, w| w.fld().set_bit());
@@ -358,13 +410,13 @@ macro_rules! can {
                     .modify(|r, w| unsafe { w.bits(r.bits() & !index_bit) });
 
                 let (data0, data1) = match filter.entry {
-                    filter::FilterEntry::Entry32([a, b]) => {
+                    FilterEntry::Entry32([a, b]) => {
                         can.fscfg
                             .modify(|r, w| unsafe { w.bits(r.bits() | index_bit) });
 
                         (a, b)
                     }
-                    filter::FilterEntry::Entry16([a, b, c, d]) => {
+                    FilterEntry::Entry16([a, b, c, d]) => {
                         can.fscfg
                             .modify(|r, w| unsafe { w.bits(r.bits() & !index_bit) });
                         let x = ((a as u32) << 16) | b as u32;
@@ -414,11 +466,11 @@ macro_rules! can {
                 };
 
                 match filter.mode {
-                    filter::FilterMode::Mask => self
+                    FilterMode::Mask => self
                         .can
                         .fmcfg
                         .modify(|r, w| unsafe { w.bits(r.bits() & !index_bit) }),
-                    filter::FilterMode::List => self
+                    FilterMode::List => self
                         .can
                         .fmcfg
                         .modify(|r, w| unsafe { w.bits(r.bits() | index_bit) }),
@@ -443,7 +495,7 @@ macro_rules! can {
                 can.fctl.modify(|_, w| w.fld().clear_bit());
             }
         }
-    }
+    };
 }
 
 can! {CAN0}

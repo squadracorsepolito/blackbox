@@ -11,8 +11,9 @@ use core::ops::DerefMut;
 use buffer::Buffer;
 use embedded_can::{ExtendedId, Id};
 use gd32vf103xx_hal::rtc::Rtc;
+use longan_nano::lcd::Lcd;
+use longan_nano::sdcard::SdCard;
 use panic_halt as _;
-
 
 use embedded_graphics::mono_font::ascii::FONT_6X10;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
@@ -22,19 +23,20 @@ use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::{Alignment, Text};
 use embedded_graphics::Drawable;
 
-use gd32vf103xx_hal::prelude::*;
 use embedded_hal::digital::v2::InputPin;
-use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType};
-use gd32vf103xx_hal::can::{Can, Frame, NoRemap, FIFO, Config};
-use gd32vf103xx_hal::can::filter::{Filter, FilterMode, FilterEntry};
+use gd32vf103xx_hal::can::{
+    self, Can, Config, Filter, FilterEntry, FilterMode, Frame, NoRemap, FIFO, Remap1,
+};
 use gd32vf103xx_hal::delay::McycleDelay;
+use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType};
 use gd32vf103xx_hal::exti::{Exti, ExtiLine, TriggerEdge};
 use gd32vf103xx_hal::gpio::gpioa::PA8;
 use gd32vf103xx_hal::gpio::{Floating, Input};
 use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC};
+use gd32vf103xx_hal::prelude::*;
 
 use longan_nano::hal::pac;
-use longan_nano::{lcd, lcd_pins, sprintln};
+use longan_nano::{lcd, lcd_pins, sdcard, sdcard_pins, sprintln};
 use riscv::interrupt::Mutex;
 use riscv_rt::entry;
 
@@ -44,16 +46,23 @@ static BUTTON: Mutex<RefCell<Option<PA8<Input<Floating>>>>> = Mutex::new(RefCell
 static COUNT: Mutex<RefCell<Option<u32>>> = Mutex::new(RefCell::new(Some(0)));
 static CHANGED: Mutex<RefCell<Option<bool>>> = Mutex::new(RefCell::new(Some(true)));
 
+static DELAY: Mutex<RefCell<Option<McycleDelay>>> = Mutex::new(RefCell::new(None));
+static RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
+static TIMESTAMP: Mutex<RefCell<Option<Timestamp>>> = Mutex::new(RefCell::new(None));
+
 static CAN0: Mutex<RefCell<Option<Can<CAN0, NoRemap>>>> = Mutex::new(RefCell::new(None));
-static CAN1: Mutex<RefCell<Option<Can<CAN1, NoRemap>>>> = Mutex::new(RefCell::new(None));
+static CAN1: Mutex<RefCell<Option<Can<CAN1, Remap1>>>> = Mutex::new(RefCell::new(None));
+
+static SDCARD: Mutex<RefCell<Option<SdCard>>> = Mutex::new(RefCell::new(None));
+
+static LCD: Mutex<RefCell<Option<Lcd>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
-    start();
-    unreachable!()
+    entrypoint()
 }
 
-fn start() {
+fn entrypoint() -> ! {
     let mut dp = pac::Peripherals::take().unwrap();
 
     let mut rcu = dp
@@ -84,21 +93,22 @@ fn start() {
     let mut backup_domain = dp.BKP.configure(&mut rcu, &mut dp.PMU);
     let rtc = Rtc::rtc(dp.RTC, &mut backup_domain);
 
-    // timestamp 
-    let mut timestamp = Timestamp::new(&rcu.clocks);
+    // timestamp
+    let timestamp = Timestamp::new(&rcu.clocks);
 
     // can
     let pa12 = gpioa.pa12.into_alternate_push_pull();
     let pa11 = gpioa.pa11.into_floating_input();
 
-    let pb13 = gpiob.pb13.into_alternate_push_pull();
-    let pb12 = gpiob.pb12.into_floating_input();
+    let pb6 = gpiob.pb6.into_alternate_push_pull();
+    let pb5 = gpiob.pb5.into_floating_input();
 
-    let mut config = Config::default();
-    config.loopback_communication = true;
+    let config = Config {
+        loopback_communication: true,
+        ..Default::default()
+    };
 
-    let mut can0 =
-        Can::<CAN0, NoRemap>::new(dp.CAN0, (pa12, pa11), config, &mut afio, &mut rcu);
+    let mut can0 = Can::<CAN0, NoRemap>::new(dp.CAN0, (pa12, pa11), config, &mut afio, &mut rcu);
 
     can0.set_filter(
         0,
@@ -118,11 +128,15 @@ fn start() {
         },
     );
 
-    let mut config = Config::default();
-    config.loopback_communication = true;
+    can0.enable_interrupt(can::Interrupt::RFFIE0);
+    can0.enable_interrupt(can::Interrupt::RFFIE1);
 
-    let mut can1 =
-        Can::<CAN1, NoRemap>::new(dp.CAN1, (pb13, pb12), config, &mut afio, &mut rcu);
+    let config = Config {
+        loopback_communication: true,
+        ..Default::default()
+    };
+
+    let mut can1 = Can::<CAN1, Remap1>::new(dp.CAN1, (pb6, pb5), config, &mut afio, &mut rcu);
 
     can1.set_filter(
         0,
@@ -142,30 +156,12 @@ fn start() {
         },
     );
 
-    let frame = Frame {
-        id: Id::Extended(ExtendedId::new(114514).unwrap()),
-        ft: false,
-        dlen: 8,
-        data: [11, 22, 33, 44, 55, 66, 77, 88],
-    };
+    can1.enable_interrupt(can::Interrupt::RFFIE0);
+    can1.enable_interrupt(can::Interrupt::RFFIE1);
 
-    nb::block!(can0.transmit(&frame)).unwrap();
-
-    sprintln!("Sent Can0!");
-
-    let a = nb::block!(can0.receive()).unwrap();
-
-    sprintln!("Can! {:?}", a);
-
-    sprintln!("Sending Can1! ...");
-
-    nb::block!(can1.transmit(&frame)).unwrap();
-
-    sprintln!("Sent Can1!");
-
-    let a = nb::block!(can1.receive()).unwrap();
-
-    sprintln!("Can1! {:?}", a);
+    // sdcard
+    let sdcard_pins = sdcard_pins!(gpiob);
+    let sdcard = sdcard::configure(dp.SPI1, sdcard_pins, sdcard::SdCardFreq::Safe, &mut rcu);
 
     // button
     let button = gpioa.pa8.into_floating_input();
@@ -186,6 +182,10 @@ fn start() {
 
     unsafe {
         ECLIC::unmask(Interrupt::EXTI_LINE9_5);
+        ECLIC::unmask(Interrupt::CAN0_RX0);
+        ECLIC::unmask(Interrupt::CAN0_RX1);
+        ECLIC::unmask(Interrupt::CAN1_RX0);
+        ECLIC::unmask(Interrupt::CAN1_RX1);
     };
 
     let mut exti = Exti::new(dp.EXTI);
@@ -198,8 +198,8 @@ fn start() {
 
     // screen
     let lcd_pins = lcd_pins!(gpioa, gpiob);
-    let mut screen = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
-    let (width, height) = (screen.size().width as u32, screen.size().height as u32);
+    let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
+    let (width, height) = (lcd.size().width as u32, lcd.size().height as u32);
 
     let character_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
@@ -209,41 +209,58 @@ fn start() {
 
     Rectangle::new(Point::new(0, 0), Size::new(width, height))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-        .draw(&mut screen)
+        .draw(&mut lcd)
         .unwrap();
 
-    let mut screen_text = [0u8; 20 * 5];
-    let mut screen_text = Buffer::new(&mut screen_text[..]);
+    let mut lcd_text = [0u8; 20 * 5];
+    let mut lcd_text = Buffer::new(&mut lcd_text[..]);
 
     riscv::interrupt::free(|cs| {
         BUTTON.borrow(cs).replace(Some(button));
+        DELAY.borrow(cs).replace(Some(delay));
+        RTC.borrow(cs).replace(Some(rtc));
+        TIMESTAMP.borrow(cs).replace(Some(timestamp));
         CAN0.borrow(cs).replace(Some(can0));
         CAN1.borrow(cs).replace(Some(can1));
+        SDCARD.borrow(cs).replace(Some(sdcard));
+        LCD.borrow(cs).replace(Some(lcd));
+    });
+
+    riscv::interrupt::free(|cs| {
+        if let Some(ref mut can0) = CAN0.borrow(cs).borrow_mut().deref_mut() {
+            let frame = Frame {
+                id: Id::Extended(ExtendedId::new(114514).unwrap()),
+                ft: false,
+                dlen: 8,
+                data: [11, 22, 33, 44, 55, 66, 77, 88],
+            };
+            nb::block!(can0.transmit(&frame)).unwrap();
+        }
     });
 
     loop {
         riscv::interrupt::free(|cs| {
-            if let (Some(ref mut count), Some(ref mut changed)) = (
+            if let (Some(ref mut count), Some(ref mut changed), Some(ref mut lcd)) = (
                 COUNT.borrow(cs).borrow_mut().deref_mut(),
                 CHANGED.borrow(cs).borrow_mut().deref_mut(),
+                LCD.borrow(cs).borrow_mut().deref_mut(),
             ) {
                 if *changed {
-                    sprintln!("{} {}", rtc.current_time(), timestamp.now());
-                    screen_text.clear();
-                    write!(&mut screen_text, "Clicked {:0>3} times", *count).unwrap();
+                    lcd_text.clear();
+                    write!(&mut lcd_text, "Clicked {:0>3} times", *count).unwrap();
                     Text::with_alignment(
-                        screen_text.as_str(),
-                        screen.bounding_box().center(),
+                        lcd_text.as_str(),
+                        lcd.bounding_box().center(),
                         character_style,
                         Alignment::Center,
                     )
-                    .draw(&mut screen)
+                    .draw(lcd)
                     .unwrap();
                     *changed = false;
                 }
             }
         });
-        delay.delay_ms(200);
+        delay.delay_ms(200)
     }
 }
 
@@ -253,6 +270,8 @@ fn start() {
 fn EXTI_LINE9_5() {
     let extiline = ExtiLine::from_gpio_line(8).unwrap();
     if Exti::is_pending(extiline) {
+        Exti::unpend(extiline);
+        Exti::clear(extiline);
         riscv::interrupt::free(|cs| {
             if let (Some(ref mut button), Some(ref mut count), Some(ref mut changed)) = (
                 BUTTON.borrow(cs).borrow_mut().deref_mut(),
@@ -266,9 +285,51 @@ fn EXTI_LINE9_5() {
                 }
             }
         });
-        Exti::unpend(extiline);
-        Exti::clear(extiline);
     }
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+fn CAN0_RX0() {
+    riscv::interrupt::free(|cs| {
+        if let Some(ref mut can0) = CAN0.borrow(cs).borrow_mut().deref_mut() {
+            let a = nb::block!(can0.receive()).unwrap();
+            sprintln!("CAN0_RX0! {:?}", a);
+        }
+    });
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+fn CAN0_RX1() {
+    riscv::interrupt::free(|cs| {
+        if let Some(ref mut can0) = CAN0.borrow(cs).borrow_mut().deref_mut() {
+            let a = nb::block!(can0.receive()).unwrap();
+            sprintln!("CAN0_RX1! {:?}", a);
+        }
+    });
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+fn CAN1_RX0() {
+    riscv::interrupt::free(|cs| {
+        if let Some(ref mut can1) = CAN1.borrow(cs).borrow_mut().deref_mut() {
+            let a = nb::block!(can1.receive()).unwrap();
+            sprintln!("CAN1_RX0! {:?}", a);
+        }
+    });
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+fn CAN1_RX1() {
+    riscv::interrupt::free(|cs| {
+        if let Some(ref mut can1) = CAN1.borrow(cs).borrow_mut().deref_mut() {
+            let a = nb::block!(can1.receive()).unwrap();
+            sprintln!("CAN1_RX1! {:?}", a);
+        }
+    });
 }
 
 /// Handle all unhandled interrupts
@@ -279,5 +340,5 @@ fn DefaultHandler() {
     let cause = riscv::register::mcause::Exception::from(code);
 
     sprintln!("default handler: code={}, cause={:?}", code, cause);
-    loop {}
+    panic!();
 }

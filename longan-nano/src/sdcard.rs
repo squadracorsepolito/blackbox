@@ -1,13 +1,13 @@
 //! On-board SD Card Slot
 
 use embedded_hal::digital::v2::OutputPin;
+use embedded_sdmmc::{Controller, SdMmcSpi, TimeSource, Timestamp};
 use gd32vf103xx_hal::gpio::gpiob::{PB12, PB13, PB14, PB15};
 use gd32vf103xx_hal::gpio::{Alternate, Floating, Input, Output, PushPull};
-use gd32vf103xx_hal::pac::{SPI1};
+use gd32vf103xx_hal::pac::SPI1;
 use gd32vf103xx_hal::rcu::Rcu;
 use gd32vf103xx_hal::spi::{Spi, MODE_0};
 use gd32vf103xx_hal::time::{Hertz, U32Ext};
-use embedded_sdmmc::{Controller, SdMmcSpi, TimeSource, Timestamp};
 
 /// Sets up all the needed GPIO pins for the sdcard
 ///
@@ -54,14 +54,14 @@ pub enum SdCardFreq {
     /// May not work for some cards
     Fast,
     /// Specify SPI frequency
-    Custom(Hertz)
+    Custom(Hertz),
 }
 
 impl From<SdCardFreq> for Hertz {
     fn from(value: SdCardFreq) -> Hertz {
         match value {
             SdCardFreq::Safe => 200.khz().into(), // using 300 kHz here because the sdcard init needs 100 to 400 kHz (see SdMmcSpi.init)
-            SdCardFreq::Fast => 27.mhz().into(),  // this is the max SPI frequency according to datasheet
+            SdCardFreq::Fast => 27.mhz().into(), // this is the max SPI frequency according to datasheet
             SdCardFreq::Custom(val) => val,
         }
     }
@@ -69,13 +69,7 @@ impl From<SdCardFreq> for Hertz {
 
 /// Constructs SD Card driver from the required components.
 pub fn configure(spi: SPI1, pins: SdCardPins, freq: SdCardFreq, rcu: &mut Rcu) -> SdCard {
-    let spi1 = Spi::spi1(
-        spi,
-        (pins.sck, pins.miso, pins.mosi),
-        MODE_0,
-        freq,
-        rcu,
-    );
+    let spi1 = Spi::spi1(spi, (pins.sck, pins.miso, pins.mosi), MODE_0, freq, rcu);
 
     let mut cs = pins.cs;
     cs.set_high().unwrap();

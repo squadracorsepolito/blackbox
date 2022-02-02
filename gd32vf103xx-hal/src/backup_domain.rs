@@ -10,7 +10,7 @@
 */
 
 use crate::pac::{BKP, PMU};
-use crate::rcu::{Rcu, Enable};
+use crate::rcu::{Enable, Rcu};
 
 /// Extension trait that sets up the `BKP` peripheral
 pub trait BkpExt {
@@ -26,9 +26,7 @@ impl BkpExt for BKP {
 
         // Enable access to the backup registers
         pmu.ctl.modify(|_r, w| w.bkpwen().set_bit());
-        BackupDomain {
-            _regs: self
-        }
+        BackupDomain { _regs: self }
     }
 }
 

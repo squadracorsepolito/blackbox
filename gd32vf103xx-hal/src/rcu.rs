@@ -1,10 +1,9 @@
 //! Reset and clock unit
 
 use crate::pac::RCU;
-use riscv::interrupt;
 use crate::time::Hertz;
 use core::cmp;
-
+use riscv::interrupt;
 
 /// Extension trait that sets up the `RCU` peripheral
 pub trait RcuExt {
@@ -89,7 +88,7 @@ impl UnconfiguredRcu {
                     for d in 1..=div_max {
                         let pllsource = source / d;
                         let pllm = target / pllsource;
-                        if pllm < 2 || pllm == 15 || pllm > 32{
+                        if pllm < 2 || pllm == 15 || pllm > 32 {
                             continue;
                         }
                         let actual_freq = pllsource * pllm;
@@ -100,7 +99,8 @@ impl UnconfiguredRcu {
                     None
                 };
 
-                let (d, m) = calculate_pll(hxtal_freq, target_sysclk).expect("invalid sysclk value");
+                let (d, m) =
+                    calculate_pll(hxtal_freq, target_sysclk).expect("invalid sysclk value");
                 predv0_bits = d - 1;
                 pllmf = m;
             } else {
@@ -152,16 +152,19 @@ impl UnconfiguredRcu {
             // Select HXTAL as prescaler input source clock
             rcu.cfg1.modify(|_, w| w.predv0sel().clear_bit());
             // Configure the prescaler
-            rcu.cfg1.modify(|_, w| unsafe { w.predv0().bits(predv0_bits) });
+            rcu.cfg1
+                .modify(|_, w| unsafe { w.predv0().bits(predv0_bits) });
         }
 
         if use_pll {
             // Configure PLL input selector
             rcu.cfg0.modify(|_, w| w.pllsel().bit(pllsel_bit));
             // Configure PLL multiplier
-            rcu.cfg0.modify(|_, w| unsafe { w
-                .pllmf_4().bit(pllmf_bits & 0x10 != 0)
-                .pllmf_3_0().bits(pllmf_bits & 0xf)
+            rcu.cfg0.modify(|_, w| unsafe {
+                w.pllmf_4()
+                    .bit(pllmf_bits & 0x10 != 0)
+                    .pllmf_3_0()
+                    .bits(pllmf_bits & 0xf)
             });
             // Enable PLL
             rcu.ctl.modify(|_, w| w.pllen().set_bit());
@@ -196,12 +199,12 @@ impl UnconfiguredRcu {
             sysclk: Hertz(target_sysclk),
             apb1_psc,
             apb2_psc,
-            usbclk_valid
+            usbclk_valid,
         };
 
         Rcu {
             clocks,
-            regs: self.regs
+            regs: self.regs,
         }
     }
 }
@@ -341,7 +344,7 @@ macro_rules! bus_enable {
                 });
             }
         }
-    }
+    };
 }
 
 macro_rules! bus {

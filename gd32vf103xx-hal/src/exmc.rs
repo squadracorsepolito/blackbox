@@ -1,23 +1,39 @@
 //! External memory controller
 
-use crate::pac::EXMC;
-use crate::rcu::{Rcu, Enable};
-use crate::gpio::gpiod::{PD0, PD1, PD4, PD5, PD6, PD7, PD8, PD9, PD10, PD11, PD12, PD13, PD14, PD15};
-use crate::gpio::gpioe::{PE0, PE1, PE2, PE3, PE4, PE5, PE6, PE7, PE8, PE9, PE10, PE11, PE12, PE13, PE14, PE15};
+use crate::gpio::gpiod::{
+    PD0, PD1, PD10, PD11, PD12, PD13, PD14, PD15, PD4, PD5, PD6, PD7, PD8, PD9,
+};
+use crate::gpio::gpioe::{
+    PE0, PE1, PE10, PE11, PE12, PE13, PE14, PE15, PE2, PE3, PE4, PE5, PE6, PE7, PE8, PE9,
+};
 use crate::gpio::{Alternate, PushPull};
+use crate::pac::EXMC;
+use crate::rcu::{Enable, Rcu};
 use vcell::VolatileCell;
 
-const REGION_SIZE: usize = 64*1024*1024;
+const REGION_SIZE: usize = 64 * 1024 * 1024;
 const REGION_PTR: *const () = 0x6000_0000 as *const ();
 
 /// Extension trait that sets up the `EXMC` peripheral
 pub trait ExmcExt {
     /// Configures the `EXMC` peripheral
-    fn configure(self, pins: ExmcPins, conf: ExmcConfiguration, timing_conf: ExmcTimingConfiguration, rcu: &mut Rcu) -> Exmc;
+    fn configure(
+        self,
+        pins: ExmcPins,
+        conf: ExmcConfiguration,
+        timing_conf: ExmcTimingConfiguration,
+        rcu: &mut Rcu,
+    ) -> Exmc;
 }
 
 impl ExmcExt for EXMC {
-    fn configure(self, pins: ExmcPins, conf: ExmcConfiguration, timing_conf: ExmcTimingConfiguration, rcu: &mut Rcu) -> Exmc {
+    fn configure(
+        self,
+        pins: ExmcPins,
+        conf: ExmcConfiguration,
+        timing_conf: ExmcTimingConfiguration,
+        rcu: &mut Rcu,
+    ) -> Exmc {
         Exmc::new(self, pins, conf, timing_conf, rcu)
     }
 }
@@ -29,7 +45,13 @@ pub struct Exmc {
 
 impl Exmc {
     /// Configures the `EXMC` peripheral
-    pub fn new(regs: EXMC, pins: ExmcPins, conf: ExmcConfiguration, timing_conf: ExmcTimingConfiguration, rcu: &mut Rcu) -> Self {
+    pub fn new(
+        regs: EXMC,
+        pins: ExmcPins,
+        conf: ExmcConfiguration,
+        timing_conf: ExmcTimingConfiguration,
+        rcu: &mut Rcu,
+    ) -> Self {
         EXMC::enable(rcu);
 
         regs.snctl0.write(|w| unsafe {
@@ -37,7 +59,8 @@ impl Exmc {
             w.nrtp().bits(conf.memory_type as u8);
             w.nrw().bits(conf.databus_width as u8);
             w.nren().bit(conf.memory_type == MemoryType::NORFlash);
-            w.nrwtpol().bit(conf.nwait_polarity == NwaitPolarity::ActiveHigh);
+            w.nrwtpol()
+                .bit(conf.nwait_polarity == NwaitPolarity::ActiveHigh);
             w.wren().bit(conf.memory_write_enabled);
             w.nrwten().bit(conf.nwait_signal_enabled);
             w.asyncwait().bit(conf.async_wait_enabled);
@@ -54,10 +77,7 @@ impl Exmc {
         // Enable memory bank
         regs.snctl0.modify(|_, w| w.nrbken().set_bit());
 
-        Exmc {
-            regs,
-            pins,
-        }
+        Exmc { regs, pins }
     }
 
     pub fn release(self) -> (EXMC, ExmcPins) {
