@@ -9,6 +9,7 @@ use core::fmt::Write;
 use core::ops::DerefMut;
 use core::panic;
 
+use embedded_graphics::primitives::{Circle, Line, PrimitiveStyle};
 use panic_halt as _;
 
 use buffer::Buffer;
@@ -19,23 +20,19 @@ use riscv_rt::entry;
 
 use embedded_can::{ExtendedId, Id};
 use embedded_graphics::draw_target::DrawTarget;
-use embedded_hal::digital::v2::InputPin;
 
 use embedded_graphics::mono_font::ascii::FONT_6X10;
 use embedded_graphics::mono_font::{MonoTextStyle, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::prelude::{Dimensions, RgbColor};
-use embedded_graphics::text::{Alignment, Text};
+use embedded_graphics::prelude::*;
+use embedded_graphics::text::{Alignment, Baseline, Text};
 use embedded_graphics::Drawable;
 
 use gd32vf103xx_hal::can::{
     self, Can, Config, Filter, FilterEntry, FilterMode, Frame, NoRemap, Remap1, FIFO,
 };
 use gd32vf103xx_hal::delay::McycleDelay;
-use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType};
-use gd32vf103xx_hal::exti::{Exti, ExtiLine, TriggerEdge};
-use gd32vf103xx_hal::gpio::gpioa::PA8;
-use gd32vf103xx_hal::gpio::{Floating, Input};
+use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits};
 use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC};
 use gd32vf103xx_hal::prelude::*;
 use gd32vf103xx_hal::rtc::Rtc;
@@ -44,10 +41,6 @@ use longan_nano::hal::pac;
 use longan_nano::lcd::Lcd;
 use longan_nano::sdcard::SdCard;
 use longan_nano::{lcd, lcd_pins, sdcard, sdcard_pins, sprintln};
-
-static BUTTON: Mutex<RefCell<Option<PA8<Input<Floating>>>>> = Mutex::new(RefCell::new(None));
-static COUNT: Mutex<RefCell<Option<u32>>> = Mutex::new(RefCell::new(Some(0)));
-static CHANGED: Mutex<RefCell<Option<bool>>> = Mutex::new(RefCell::new(Some(true)));
 
 static DELAY: Mutex<RefCell<Option<McycleDelay>>> = Mutex::new(RefCell::new(None));
 static RTC: Mutex<RefCell<Option<Rtc>>> = Mutex::new(RefCell::new(None));
@@ -168,36 +161,17 @@ fn entrypoint() -> ! {
     let sdcard_pins = sdcard_pins!(gpiob);
     let mut sdcard = sdcard::configure(dp.SPI1, sdcard_pins, sdcard::SdCardFreq::Safe, &mut rcu);
 
-    // button
-    let button = gpioa.pa8.into_floating_input();
-
     // interrupts
     ECLIC::reset();
     ECLIC::set_threshold_level(Level::L0);
     ECLIC::set_level_priority_bits(LevelPriorityBits::L3P1);
 
-    ECLIC::setup(
-        Interrupt::EXTI_LINE9_5,
-        TriggerType::Level,
-        Level::L1,
-        Priority::P1,
-    );
-
-    afio.extiss(button.port(), button.pin_number());
-
     unsafe {
-        ECLIC::unmask(Interrupt::EXTI_LINE9_5);
         ECLIC::unmask(Interrupt::CAN0_RX0);
         ECLIC::unmask(Interrupt::CAN0_RX1);
         ECLIC::unmask(Interrupt::CAN1_RX0);
         ECLIC::unmask(Interrupt::CAN1_RX1);
     };
-
-    let mut exti = Exti::new(dp.EXTI);
-
-    let extiline = ExtiLine::from_gpio_line(button.pin_number()).unwrap();
-    exti.listen(extiline, TriggerEdge::Both);
-    Exti::clear(extiline);
 
     unsafe { riscv::interrupt::enable() };
 
@@ -205,16 +179,13 @@ fn entrypoint() -> ! {
     let lcd_pins = lcd_pins!(gpioa, gpiob);
     let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
 
-    let character_style = MonoTextStyleBuilder::new()
+    let lcd_text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(Rgb565::WHITE)
         .background_color(Rgb565::BLACK)
         .build();
 
     lcd.clear(Rgb565::BLACK).unwrap();
-
-    let mut lcd_text = [0u8; 20 * 5];
-    let mut lcd_text = Buffer::new(&mut lcd_text[..]);
 
     // All hardware is now initialized, so let's do preliminary checks that can
     // be debugged with the LCD.
@@ -233,7 +204,6 @@ fn entrypoint() -> ! {
     }
 
     riscv::interrupt::free(|cs| {
-        BUTTON.borrow(cs).replace(Some(button));
         DELAY.borrow(cs).replace(Some(delay));
         RTC.borrow(cs).replace(Some(rtc));
         TIMESTAMP.borrow(cs).replace(Some(timestamp));
@@ -255,52 +225,49 @@ fn entrypoint() -> ! {
         }
     });
 
+    let mut lcd_timer_text = [0u8; 20 * 5];
+    let mut lcd_timer_text = Buffer::new(&mut lcd_timer_text[..]);
+
     loop {
         riscv::interrupt::free(|cs| {
-            if let (Some(ref mut count), Some(ref mut changed), Some(ref mut lcd)) = (
-                COUNT.borrow(cs).borrow_mut().deref_mut(),
-                CHANGED.borrow(cs).borrow_mut().deref_mut(),
+            if let (Some(ref mut lcd), Some(ref mut rtc)) = (
                 LCD.borrow(cs).borrow_mut().deref_mut(),
+                RTC.borrow(cs).borrow_mut().deref_mut(),
             ) {
-                if *changed {
-                    lcd_text.clear();
-                    write!(&mut lcd_text, "Clicked {:0>3} times", *count).unwrap();
-                    Text::with_alignment(
-                        lcd_text.as_str(),
-                        lcd.bounding_box().center(),
-                        character_style,
-                        Alignment::Center,
-                    )
+                let now = rtc.current_time();
+                let hours = now / 3600;
+                let minutes = (now / 60) % 60;
+                let seconds = now % 60;
+
+                lcd_timer_text.clear();
+                write!(
+                    &mut lcd_timer_text,
+                    "{:0>2}:{:0>2}:{:0>2}",
+                    hours, minutes, seconds
+                )
+                .unwrap();
+
+                Text::with_baseline(
+                    lcd_timer_text.as_str(),
+                    Point::new(5, 5),
+                    lcd_text_style,
+                    Baseline::Top,
+                )
+                .draw(lcd)
+                .unwrap();
+
+                Circle::with_center(Point::new(160 - 10, 8), 10)
+                    .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
                     .draw(lcd)
                     .unwrap();
-                    *changed = false;
-                }
-            }
-        });
-        delay.delay_ms(200)
-    }
-}
 
-/// Handle boot0 button press
-#[allow(non_snake_case)]
-#[no_mangle]
-fn EXTI_LINE9_5() {
-    let extiline = ExtiLine::from_gpio_line(8).unwrap();
-    if Exti::is_pending(extiline) {
-        Exti::unpend(extiline);
-        Exti::clear(extiline);
-        riscv::interrupt::free(|cs| {
-            if let (Some(ref mut button), Some(ref mut count), Some(ref mut changed)) = (
-                BUTTON.borrow(cs).borrow_mut().deref_mut(),
-                COUNT.borrow(cs).borrow_mut().deref_mut(),
-                CHANGED.borrow(cs).borrow_mut().deref_mut(),
-            ) {
-                if button.is_high().unwrap() {
-                    *count += 1;
-                    *changed = true;
-                }
+                Line::new(Point::new(2, 20), Point::new(160 - 2, 20))
+                    .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+                    .draw(lcd)
+                    .unwrap();
             }
         });
+        delay.delay_ms(500)
     }
 }
 
