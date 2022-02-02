@@ -88,7 +88,7 @@ pub enum Interrupt {
     ERRNIE,
     ERRIE = 15,
     WIE,
-    SLPWIE
+    SLPWIE,
 }
 
 mod filter_banks {

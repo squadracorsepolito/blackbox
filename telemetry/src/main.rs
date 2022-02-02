@@ -7,25 +7,29 @@ pub mod timestamp;
 use core::cell::RefCell;
 use core::fmt::Write;
 use core::ops::DerefMut;
+use core::panic;
 
-use buffer::Buffer;
-use embedded_can::{ExtendedId, Id};
-use gd32vf103xx_hal::rtc::Rtc;
-use longan_nano::lcd::Lcd;
-use longan_nano::sdcard::SdCard;
 use panic_halt as _;
 
+use buffer::Buffer;
+use timestamp::Timestamp;
+
+use riscv::interrupt::Mutex;
+use riscv_rt::entry;
+
+use embedded_can::{ExtendedId, Id};
+use embedded_graphics::draw_target::DrawTarget;
+use embedded_hal::digital::v2::InputPin;
+
 use embedded_graphics::mono_font::ascii::FONT_6X10;
-use embedded_graphics::mono_font::MonoTextStyleBuilder;
+use embedded_graphics::mono_font::{MonoTextStyle, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::prelude::{Dimensions, OriginDimensions, Point, Primitive, RgbColor, Size};
-use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+use embedded_graphics::prelude::{Dimensions, RgbColor};
 use embedded_graphics::text::{Alignment, Text};
 use embedded_graphics::Drawable;
 
-use embedded_hal::digital::v2::InputPin;
 use gd32vf103xx_hal::can::{
-    self, Can, Config, Filter, FilterEntry, FilterMode, Frame, NoRemap, FIFO, Remap1,
+    self, Can, Config, Filter, FilterEntry, FilterMode, Frame, NoRemap, Remap1, FIFO,
 };
 use gd32vf103xx_hal::delay::McycleDelay;
 use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits, Priority, TriggerType};
@@ -34,13 +38,12 @@ use gd32vf103xx_hal::gpio::gpioa::PA8;
 use gd32vf103xx_hal::gpio::{Floating, Input};
 use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC};
 use gd32vf103xx_hal::prelude::*;
+use gd32vf103xx_hal::rtc::Rtc;
 
 use longan_nano::hal::pac;
+use longan_nano::lcd::Lcd;
+use longan_nano::sdcard::SdCard;
 use longan_nano::{lcd, lcd_pins, sdcard, sdcard_pins, sprintln};
-use riscv::interrupt::Mutex;
-use riscv_rt::entry;
-
-use crate::timestamp::Timestamp;
 
 static BUTTON: Mutex<RefCell<Option<PA8<Input<Floating>>>>> = Mutex::new(RefCell::new(None));
 static COUNT: Mutex<RefCell<Option<u32>>> = Mutex::new(RefCell::new(Some(0)));
@@ -88,6 +91,8 @@ fn entrypoint() -> ! {
         &mut afio,
         &mut rcu,
     );
+
+    sprintln!("-= telemetry =-");
 
     // rtc
     let mut backup_domain = dp.BKP.configure(&mut rcu, &mut dp.PMU);
@@ -161,7 +166,7 @@ fn entrypoint() -> ! {
 
     // sdcard
     let sdcard_pins = sdcard_pins!(gpiob);
-    let sdcard = sdcard::configure(dp.SPI1, sdcard_pins, sdcard::SdCardFreq::Safe, &mut rcu);
+    let mut sdcard = sdcard::configure(dp.SPI1, sdcard_pins, sdcard::SdCardFreq::Safe, &mut rcu);
 
     // button
     let button = gpioa.pa8.into_floating_input();
@@ -199,7 +204,6 @@ fn entrypoint() -> ! {
     // screen
     let lcd_pins = lcd_pins!(gpioa, gpiob);
     let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
-    let (width, height) = (lcd.size().width as u32, lcd.size().height as u32);
 
     let character_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
@@ -207,13 +211,26 @@ fn entrypoint() -> ! {
         .background_color(Rgb565::BLACK)
         .build();
 
-    Rectangle::new(Point::new(0, 0), Size::new(width, height))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-        .draw(&mut lcd)
-        .unwrap();
+    lcd.clear(Rgb565::BLACK).unwrap();
 
     let mut lcd_text = [0u8; 20 * 5];
     let mut lcd_text = Buffer::new(&mut lcd_text[..]);
+
+    // All hardware is now initialized, so let's do preliminary checks that can
+    // be debugged with the LCD.
+
+    if let Err(_) = sdcard.device().init() {
+        Text::with_alignment(
+            "ERROR!\nSD Card not initialized",
+            lcd.bounding_box().center(),
+            MonoTextStyle::new(&FONT_6X10, Rgb565::RED),
+            Alignment::Center,
+        )
+        .draw(&mut lcd)
+        .unwrap();
+        sprintln!("Failed to initialize sdcard!");
+        panic!();
+    }
 
     riscv::interrupt::free(|cs| {
         BUTTON.borrow(cs).replace(Some(button));
@@ -281,7 +298,6 @@ fn EXTI_LINE9_5() {
                 if button.is_high().unwrap() {
                     *count += 1;
                     *changed = true;
-                    sprintln!("Interrupt {}", count);
                 }
             }
         });
