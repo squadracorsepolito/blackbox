@@ -1,7 +1,11 @@
 [workspace]
-
 members = [
   "gd32vf103xx-hal",
   "longan-nano",
   "telemetry"
 ]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

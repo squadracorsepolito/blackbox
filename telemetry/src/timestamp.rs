@@ -1,19 +1,23 @@
-use gd32vf103xx_hal::rcu::Clocks;
+use gd32vf103xx_hal::{rcu::Clocks};
 
-#[derive(Copy, Clone)]
 pub struct Timestamp {
-    core_frequency: u32,
+    starting_time: u64,
+    core_frequency: u64,
 }
 
 impl Timestamp {
-    /// Constructs the delay provider
-    pub fn new(clocks: &Clocks) -> Self {
+    pub fn new(starting_time: u32, clocks: &Clocks) -> Self {
         Self {
-            core_frequency: clocks.sysclk().0,
+            starting_time: starting_time as u64,
+            core_frequency: clocks.sysclk().0 as u64,
         }
     }
 
-    pub fn now(&mut self) -> u64 {
-        (riscv::register::mcycle::read64() * 1_000_000) / self.core_frequency as u64
+    pub fn tick_us(&self) -> u64 {
+        self.starting_time  * 1_000_000 + (riscv::register::mcycle::read64() * 1_000_000) / self.core_frequency
+    }
+
+    pub fn tick_ms(&self) -> u64 {
+        self.starting_time  * 1_000 + (riscv::register::mcycle::read64() * 1_000) / self.core_frequency
     }
 }
