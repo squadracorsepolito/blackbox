@@ -37,18 +37,18 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
-            // 125KBps
-            prescaler: 48,
+            // 1 MBps
+            prescaler: 6,
             auto_bus_off_recovery: false,
-            auto_retransmission: true,
+            auto_retransmission: false,
             auto_wake_up: false,
             receive_fifo_overwrite: true,
             time_triggered_communication: false,
             trans_fifo_order: false,
             silent_communication: false,
             loopback_communication: false,
-            resync_jump_width: TQ(0),
-            time_segment_1: TQ(4),
+            resync_jump_width: TQ(1),
+            time_segment_1: TQ(15),
             time_segment_2: TQ(2),
         }
     }

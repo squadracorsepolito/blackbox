@@ -5,52 +5,49 @@ pub mod buffer;
 pub mod timestamp;
 pub mod faces;
 
+use core::ops::{DerefMut, Sub};
 use core::cell::RefCell;
 use core::fmt::Write;
-use core::ops::{DerefMut, Sub};
 use core::panic;
 
 use embedded_graphics::image::{ImageRaw, Image};
+use embedded_graphics::mono_font::MonoTextStyleBuilder;
+use embedded_graphics::mono_font::ascii::FONT_6X10;
+use embedded_graphics::pixelcolor::Rgb565;
+
 use embedded_graphics::pixelcolor::raw::LittleEndian;
+use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle, Line, Arc, PrimitiveStyleBuilder, StrokeAlignment};
+use embedded_graphics::text::{Text, Baseline, TextStyleBuilder, Alignment};
 use panic_halt as _;
 
-use buffer::Buffer;
 use timestamp::Timestamp;
 
 use riscv::interrupt::{CriticalSection, Mutex};
 use riscv_rt::entry;
 
-use embedded_graphics::prelude::*;
-
-use embedded_can::{ExtendedId, Id};
-use embedded_graphics::draw_target::DrawTarget;
-use embedded_graphics::mono_font::ascii::FONT_6X10;
-use embedded_graphics::mono_font::MonoTextStyleBuilder;
-use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::primitives::{
-    Arc, Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment,
-};
-use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
-use embedded_graphics::Drawable;
+use embedded_can::Id;
 
 use embedded_sdmmc::VolumeIdx;
 
-use gd32vf103xx_hal::can::{
-    self, Can, Config, Filter, FilterEntry, FilterMode, Frame, NoRemap, Remap1, FIFO,
-};
+use embedded_graphics::prelude::*;
+
 use gd32vf103xx_hal::delay::McycleDelay;
+use gd32vf103xx_hal::can::{self, Can, Config, Filter, FilterEntry, FilterMode, FIFO};
 use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits};
-use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC};
+use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC, TIMER1};
 use gd32vf103xx_hal::prelude::*;
+use gd32vf103xx_hal::pwm::{self, Channel, PwmTimer};
 use gd32vf103xx_hal::rtc::Rtc;
 
 use longan_nano::hal::pac;
-use longan_nano::{lcd, lcd_pins, sdcard, sdcard_pins, sprintln};
+use longan_nano::{sdcard, sdcard_pins, sprintln, lcd_pins, lcd};
+
+use crate::buffer::Buffer;
 
 pub static TIMESTAMP: Mutex<RefCell<Option<Timestamp>>> = Mutex::new(RefCell::new(None));
 
-pub static CAN0: Mutex<RefCell<Option<Can<CAN0, NoRemap>>>> = Mutex::new(RefCell::new(None));
-pub static CAN1: Mutex<RefCell<Option<Can<CAN1, Remap1>>>> = Mutex::new(RefCell::new(None));
+pub static CAN0: Mutex<RefCell<Option<Can<CAN0, can::NoRemap>>>> = Mutex::new(RefCell::new(None));
+pub static CAN1: Mutex<RefCell<Option<Can<CAN1, can::Remap1>>>> = Mutex::new(RefCell::new(None));
 
 pub const CAN_FRAME_SIZE: usize = 20;
 pub const CAN_BUFFER_SIZE: usize = 8 * CAN_FRAME_SIZE;
@@ -85,6 +82,22 @@ fn entrypoint() -> ! {
     let gpioa = dp.GPIOA.split(&mut rcu);
     let gpiob = dp.GPIOB.split(&mut rcu);
 
+    let timer1 = dp.TIMER1;
+
+    let pa3 = gpioa.pa3.into_alternate_push_pull();
+
+    let mut pwm_t4 = PwmTimer::<TIMER1, pwm::NoRemap>::new(
+        timer1,
+        (None, None, None, Some(&pa3)),
+        &mut rcu,
+        &mut afio,
+    );
+
+    let max = pwm_t4.get_max_duty();
+    pwm_t4.set_period(500_000.hz());
+    pwm_t4.set_duty(Channel::CH3, max / 2); // 50% duty cycle
+    pwm_t4.enable(Channel::CH3);
+
     // stdout
     longan_nano::stdout::configure(
         dp.USART0,
@@ -96,6 +109,8 @@ fn entrypoint() -> ! {
     );
 
     sprintln!("-= telemetry =-");
+
+    sprintln!("{} {}", rcu.clocks.pclk1().0, rcu.clocks.pclk2().0);
 
     // rtc
     let mut backup_domain = dp.BKP.configure(&mut rcu, &mut dp.PMU);
@@ -111,12 +126,10 @@ fn entrypoint() -> ! {
     let pb6 = gpiob.pb6.into_alternate_push_pull();
     let pb5 = gpiob.pb5.into_floating_input();
 
-    let config = Config {
-        loopback_communication: true,
-        ..Default::default()
-    };
+    let config = Config::default();
 
-    let mut can0 = Can::<CAN0, NoRemap>::new(dp.CAN0, (pa12, pa11), config, &mut afio, &mut rcu);
+    let mut can0 =
+        Can::<CAN0, can::NoRemap>::new(dp.CAN0, (pa12, pa11), config, &mut afio, &mut rcu);
 
     can0.set_filter(
         0,
@@ -132,19 +145,16 @@ fn entrypoint() -> ! {
         Filter {
             mode: FilterMode::Mask,
             entry: FilterEntry::Entry32([0, 0]),
-            fifo_index: FIFO::FIFO0,
+            fifo_index: FIFO::FIFO1,
         },
     );
 
     can0.enable_interrupt(can::Interrupt::RFFIE0);
     can0.enable_interrupt(can::Interrupt::RFFIE1);
 
-    let config = Config {
-        loopback_communication: true,
-        ..Default::default()
-    };
+    let config = Config::default();
 
-    let mut can1 = Can::<CAN1, Remap1>::new(dp.CAN1, (pb6, pb5), config, &mut afio, &mut rcu);
+    let mut can1 = Can::<CAN1, can::Remap1>::new(dp.CAN1, (pb6, pb5), config, &mut afio, &mut rcu);
 
     can1.set_filter(
         0,
@@ -203,18 +213,9 @@ fn entrypoint() -> ! {
 
     lcd.clear(Rgb565::BLACK).unwrap();
 
-    // All hardware is now initialized, so let's do preliminary checks that can
-    // be debugged with the LCD.
+    // All hardware is now initialized, so let's do preliminary checks.
 
     if let Err(error) = sdcard.device().init() {
-        Text::with_alignment(
-            "ERROR!\nSD Card not initialized",
-            lcd.bounding_box().center(),
-            lcd_text_style_red,
-            Alignment::Center,
-        )
-        .draw(&mut lcd)
-        .unwrap();
         sprintln!("Failed to initialize sdcard! {:?}", error);
         panic!();
     }
@@ -229,18 +230,6 @@ fn entrypoint() -> ! {
         CAN1_PRODUCER.borrow(cs).replace(Some(can1_producer));
     });
 
-    riscv::interrupt::free(|cs| {
-        if let Some(ref mut can0) = CAN0.borrow(cs).borrow_mut().deref_mut() {
-            let frame = Frame {
-                id: Id::Extended(ExtendedId::new(114514).unwrap()),
-                ft: false,
-                dlen: 8,
-                data: [11, 22, 33, 44, 55, 66, 77, 88],
-            };
-            nb::block!(can0.transmit(&frame)).unwrap();
-        }
-    });
-
     let mut volume = sdcard.get_volume(VolumeIdx(0)).unwrap();
 
     // list files in root dir
@@ -249,8 +238,8 @@ fn entrypoint() -> ! {
         .open_file_in_dir(
             &mut volume,
             &root_dir,
-            "can0",
-            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+            "CAN0",
+            embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
         )
         .unwrap();
 
@@ -258,8 +247,8 @@ fn entrypoint() -> ! {
         .open_file_in_dir(
             &mut volume,
             &root_dir,
-            "can1",
-            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+            "CAN1",
+            embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
         )
         .unwrap();
 
@@ -277,6 +266,7 @@ fn entrypoint() -> ! {
     loop {
         if let Ok(rgr) = can0_consumer.read() {
             if let Ok(size) = sdcard.write(&mut volume, &mut can0_file, rgr.buf()) {
+                sprintln!("CAN1 wrote {} bytes", size);
                 sdcard_used_size += size;
                 rgr.release(size);
             } else {
@@ -286,6 +276,7 @@ fn entrypoint() -> ! {
         }
         if let Ok(rgr) = can1_consumer.read() {
             if let Ok(size) = sdcard.write(&mut volume, &mut can1_file, rgr.buf()) {
+                sprintln!("CAN1 wrote {} bytes", size);
                 sdcard_used_size += size;
                 rgr.release(size);
             } else {
