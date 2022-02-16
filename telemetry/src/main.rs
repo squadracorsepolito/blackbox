@@ -2,22 +2,13 @@
 #![no_main]
 
 pub mod buffer;
-pub mod timestamp;
 pub mod faces;
+pub mod timestamp;
 
-use core::ops::{DerefMut, Sub};
 use core::cell::RefCell;
-use core::fmt::Write;
+use core::ops::DerefMut;
 use core::panic;
 
-use embedded_graphics::image::{ImageRaw, Image};
-use embedded_graphics::mono_font::MonoTextStyleBuilder;
-use embedded_graphics::mono_font::ascii::FONT_6X10;
-use embedded_graphics::pixelcolor::Rgb565;
-
-use embedded_graphics::pixelcolor::raw::LittleEndian;
-use embedded_graphics::primitives::{Circle, PrimitiveStyle, Rectangle, Line, Arc, PrimitiveStyleBuilder, StrokeAlignment};
-use embedded_graphics::text::{Text, Baseline, TextStyleBuilder, Alignment};
 use panic_halt as _;
 
 use timestamp::Timestamp;
@@ -29,10 +20,8 @@ use embedded_can::Id;
 
 use embedded_sdmmc::VolumeIdx;
 
-use embedded_graphics::prelude::*;
-
-use gd32vf103xx_hal::delay::McycleDelay;
 use gd32vf103xx_hal::can::{self, Can, Config, Filter, FilterEntry, FilterMode, FIFO};
+use gd32vf103xx_hal::delay::McycleDelay;
 use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits};
 use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC, TIMER1};
 use gd32vf103xx_hal::prelude::*;
@@ -40,9 +29,7 @@ use gd32vf103xx_hal::pwm::{self, Channel, PwmTimer};
 use gd32vf103xx_hal::rtc::Rtc;
 
 use longan_nano::hal::pac;
-use longan_nano::{sdcard, sdcard_pins, sprintln, lcd_pins, lcd};
-
-use crate::buffer::Buffer;
+use longan_nano::{sdcard, sdcard_pins, sprintln};
 
 pub static TIMESTAMP: Mutex<RefCell<Option<Timestamp>>> = Mutex::new(RefCell::new(None));
 
@@ -195,24 +182,6 @@ fn entrypoint() -> ! {
 
     unsafe { riscv::interrupt::enable() };
 
-    // screen
-    let lcd_pins = lcd_pins!(gpioa, gpiob);
-    let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
-
-    let lcd_text_style_white = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(Rgb565::WHITE)
-        .background_color(Rgb565::BLACK)
-        .build();
-
-    let lcd_text_style_red = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
-        .text_color(Rgb565::RED)
-        .background_color(Rgb565::BLACK)
-        .build();
-
-    lcd.clear(Rgb565::BLACK).unwrap();
-
     // All hardware is now initialized, so let's do preliminary checks.
 
     if let Err(error) = sdcard.device().init() {
@@ -252,22 +221,10 @@ fn entrypoint() -> ! {
         )
         .unwrap();
 
-    let sdcard_max_size: usize = sdcard.device().card_size_bytes().unwrap() as usize / 1_000_000;
-    let mut sdcard_used_size: usize = can0_file.length() as usize + can1_file.length() as usize;
-
-    let mut lcd_text = [0u8; 20 * 5];
-    let mut lcd_text = Buffer::new(&mut lcd_text[..]);
-
-    let raw_image: ImageRaw<Rgb565, LittleEndian> = ImageRaw::new(&faces::COOL, faces::WIDTH);
-    Image::new(&raw_image, Point::new(10, 45 - faces::HEIGHT as i32 / 2))
-        .draw(&mut lcd)
-        .unwrap();
-
     loop {
         if let Ok(rgr) = can0_consumer.read() {
             if let Ok(size) = sdcard.write(&mut volume, &mut can0_file, rgr.buf()) {
                 sprintln!("CAN1 wrote {} bytes", size);
-                sdcard_used_size += size;
                 rgr.release(size);
             } else {
                 sprintln!("failed to write can0");
@@ -277,7 +234,6 @@ fn entrypoint() -> ! {
         if let Ok(rgr) = can1_consumer.read() {
             if let Ok(size) = sdcard.write(&mut volume, &mut can1_file, rgr.buf()) {
                 sprintln!("CAN1 wrote {} bytes", size);
-                sdcard_used_size += size;
                 rgr.release(size);
             } else {
                 sprintln!("failed to write can1");
@@ -285,108 +241,7 @@ fn entrypoint() -> ! {
             }
         }
 
-        // rendering
-        let now = rtc.current_time();
-        let (hours, minutes, seconds) = (now / 3600, (now / 60) % 60, now % 60);
-
-        lcd_text.clear();
-        write!(
-            &mut lcd_text,
-            "{:0>2}:{:0>2}:{:0>2}",
-            hours, minutes, seconds
-        )
-        .unwrap();
-
-        Text::with_baseline(
-            lcd_text.as_str(),
-            Point::new(5, 5),
-            lcd_text_style_white,
-            Baseline::Top,
-        )
-        .draw(&mut lcd)
-        .unwrap();
-
-        if true {
-            // is recording
-            Text::with_text_style(
-                "REC",
-                Point::new(160 - 16, 5),
-                lcd_text_style_red,
-                TextStyleBuilder::new()
-                    .alignment(Alignment::Right)
-                    .baseline(Baseline::Top)
-                    .build(),
-            )
-            .draw(&mut lcd)
-            .unwrap();
-
-            Circle::with_center(Point::new(160 - 9, 9), 8)
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-                .draw(&mut lcd)
-                .unwrap();
-        } else {
-            Rectangle::with_corners(Point::new(160 - 16, 0), Point::new(160, 18))
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-                .draw(&mut lcd)
-                .unwrap();
-        }
-
-        Line::new(Point::new(2, 20), Point::new(160 - 2, 20))
-            .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
-            .draw(&mut lcd)
-            .unwrap();
-
-        let sdcard_used_percentage = sdcard_used_size as f32 / sdcard_max_size as f32;
-        let sweep = sdcard_used_percentage * 360.0;
-
-        Arc::new(
-            Point::new(130, 50).sub(Point::new(20, 20)),
-            40,
-            (90.0 + sweep).deg(),
-            (360.0 - sweep).deg(),
-        )
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .stroke_color(Rgb565::new(10, 10, 10))
-                .stroke_width(5)
-                .stroke_alignment(StrokeAlignment::Inside)
-                .build(),
-        )
-        .draw(&mut lcd)
-        .unwrap();
-
-        Arc::new(
-            Point::new(130, 50).sub(Point::new(20, 20)),
-            40,
-            90.0.deg(),
-            sweep.deg(),
-        )
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .stroke_color(Rgb565::BLUE)
-                .stroke_width(5)
-                .stroke_alignment(StrokeAlignment::Inside)
-                .build(),
-        )
-        .draw(&mut lcd)
-        .unwrap();
-
-        lcd_text.clear();
-        write!(&mut lcd_text, "{:0>2.0}%", sdcard_used_percentage * 100.).unwrap();
-
-        Text::with_text_style(
-            lcd_text.as_str(),
-            Point::new(130, 50),
-            lcd_text_style_white,
-            TextStyleBuilder::new()
-                .alignment(Alignment::Center)
-                .baseline(Baseline::Middle)
-                .build(),
-        )
-        .draw(&mut lcd)
-        .unwrap();
-
-        delay.delay_ms(500)
+        delay.delay_ms(100)
     }
 }
 
