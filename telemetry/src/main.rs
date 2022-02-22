@@ -7,9 +7,10 @@ pub mod timestamp;
 
 use core::cell::RefCell;
 use core::ops::DerefMut;
-use core::panic;
+use core::panic::PanicInfo;
+use core::sync::atomic::{self, Ordering};
 
-use panic_halt as _;
+use embedded_hal::digital::v2::InputPin;
 
 use timestamp::Timestamp;
 
@@ -23,7 +24,7 @@ use embedded_sdmmc::VolumeIdx;
 use gd32vf103xx_hal::can::{self, Can, Config, Filter, FilterEntry, FilterMode, FIFO};
 use gd32vf103xx_hal::delay::McycleDelay;
 use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits};
-use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC, TIMER1};
+use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC, TIMER3};
 use gd32vf103xx_hal::prelude::*;
 use gd32vf103xx_hal::pwm::{self, Channel, PwmTimer};
 use gd32vf103xx_hal::rtc::Rtc;
@@ -37,7 +38,7 @@ pub static CAN0: Mutex<RefCell<Option<Can<CAN0, can::NoRemap>>>> = Mutex::new(Re
 pub static CAN1: Mutex<RefCell<Option<Can<CAN1, can::Remap1>>>> = Mutex::new(RefCell::new(None));
 
 pub const CAN_FRAME_SIZE: usize = 20;
-pub const CAN_BUFFER_SIZE: usize = 8 * CAN_FRAME_SIZE;
+pub const CAN_BUFFER_SIZE: usize = 64 * CAN_FRAME_SIZE;
 
 pub static CAN0_BUFFER: bbqueue::BBBuffer<CAN_BUFFER_SIZE> = bbqueue::BBBuffer::new();
 pub static CAN0_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, CAN_BUFFER_SIZE>>>> =
@@ -46,6 +47,15 @@ pub static CAN0_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, CAN_BU
 pub static CAN1_BUFFER: bbqueue::BBBuffer<CAN_BUFFER_SIZE> = bbqueue::BBBuffer::new();
 pub static CAN1_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, CAN_BUFFER_SIZE>>>> =
     Mutex::new(RefCell::new(None));
+
+#[inline(never)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    sprintln!("{}", info);
+    loop {
+        atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
 
 #[entry]
 fn main() -> ! {
@@ -69,39 +79,23 @@ fn entrypoint() -> ! {
     let gpioa = dp.GPIOA.split(&mut rcu);
     let gpiob = dp.GPIOB.split(&mut rcu);
 
-    let timer1 = dp.TIMER1;
-
-    let pa3 = gpioa.pa3.into_alternate_push_pull();
-
-    let mut pwm_t4 = PwmTimer::<TIMER1, pwm::NoRemap>::new(
-        timer1,
-        (None, None, None, Some(&pa3)),
-        &mut rcu,
-        &mut afio,
-    );
-
-    let max = pwm_t4.get_max_duty();
-    pwm_t4.set_period(500_000.hz());
-    pwm_t4.set_duty(Channel::CH3, max / 2); // 50% duty cycle
-    pwm_t4.enable(Channel::CH3);
-
     // stdout
     longan_nano::stdout::configure(
         dp.USART0,
         gpioa.pa9,
         gpioa.pa10,
-        9600.bps(),
+        115_200.bps(),
         &mut afio,
         &mut rcu,
     );
 
     sprintln!("-= telemetry =-");
 
-    sprintln!("{} {}", rcu.clocks.pclk1().0, rcu.clocks.pclk2().0);
-
     // rtc
     let mut backup_domain = dp.BKP.configure(&mut rcu, &mut dp.PMU);
     let rtc = Rtc::rtc(dp.RTC, &mut backup_domain);
+
+    sprintln!("rtc {}", rtc.current_time());
 
     // timestamp
     let timestamp = Timestamp::new(rtc.current_time(), &rcu.clocks);
@@ -112,6 +106,8 @@ fn entrypoint() -> ! {
 
     let pb6 = gpiob.pb6.into_alternate_push_pull();
     let pb5 = gpiob.pb5.into_floating_input();
+
+    sprintln!("setting up can0");
 
     let config = Config::default();
 
@@ -139,6 +135,8 @@ fn entrypoint() -> ! {
     can0.enable_interrupt(can::Interrupt::RFFIE0);
     can0.enable_interrupt(can::Interrupt::RFFIE1);
 
+    sprintln!("setting up can1");
+
     let config = Config::default();
 
     let mut can1 = Can::<CAN1, can::Remap1>::new(dp.CAN1, (pb6, pb5), config, &mut afio, &mut rcu);
@@ -165,10 +163,18 @@ fn entrypoint() -> ! {
     can1.enable_interrupt(can::Interrupt::RFFIE1);
 
     // sdcard
+    sprintln!("setting up sdcard");
+
     let sdcard_pins = sdcard_pins!(gpiob);
     let mut sdcard = sdcard::configure(dp.SPI1, sdcard_pins, sdcard::SdCardFreq::Safe, &mut rcu);
 
+    if let Err(error) = sdcard.device().init() {
+        sprintln!("failed to initialize sdcard! {:?}", error);
+    }
+
     // interrupts
+    sprintln!("setting up interrupts");
+
     ECLIC::reset();
     ECLIC::set_threshold_level(Level::L0);
     ECLIC::set_level_priority_bits(LevelPriorityBits::L3P1);
@@ -184,10 +190,7 @@ fn entrypoint() -> ! {
 
     // All hardware is now initialized, so let's do preliminary checks.
 
-    if let Err(error) = sdcard.device().init() {
-        sprintln!("Failed to initialize sdcard! {:?}", error);
-        panic!();
-    }
+    sprintln!("setting up global resources and buffers");
 
     let (can0_producer, mut can0_consumer) = CAN0_BUFFER.try_split().unwrap();
     let (can1_producer, mut can1_consumer) = CAN1_BUFFER.try_split().unwrap();
@@ -199,10 +202,16 @@ fn entrypoint() -> ! {
         CAN1_PRODUCER.borrow(cs).replace(Some(can1_producer));
     });
 
+    sprintln!("setting up sdcard volumes");
+
     let mut volume = sdcard.get_volume(VolumeIdx(0)).unwrap();
+
+    sprintln!("setting up sdcard CAN0 log");
 
     // list files in root dir
     let root_dir = sdcard.open_root_dir(&volume).unwrap();
+    let header = [0u8; 2];
+
     let mut can0_file = sdcard
         .open_file_in_dir(
             &mut volume,
@@ -211,6 +220,12 @@ fn entrypoint() -> ! {
             embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
         )
         .unwrap();
+
+    sprintln!("setting up sdcard CAN1 log");
+
+    if can0_file.length() == 0 {
+        sdcard.write(&mut volume, &mut can0_file, &header).unwrap();
+    }
 
     let mut can1_file = sdcard
         .open_file_in_dir(
@@ -221,10 +236,35 @@ fn entrypoint() -> ! {
         )
         .unwrap();
 
+    if can1_file.length() == 0 {
+        sdcard.write(&mut volume, &mut can1_file, &header).unwrap();
+    }
+
+    sprintln!("setting up buzzer");
+
+    let timer3 = dp.TIMER3;
+
+    let pb9 = gpiob.pb9.into_alternate_push_pull();
+
+    let mut buzzer = PwmTimer::<TIMER3, pwm::NoRemap>::new(
+        timer3,
+        (None, None, None, Some(&pb9)),
+        &mut rcu,
+        &mut afio,
+    );
+
+    let max = buzzer.get_max_duty();
+    buzzer.set_period(500.hz());
+    buzzer.set_duty(Channel::CH3, max / 2); // 50% duty cycle
+
+    sprintln!("setting up switch");
+
+    let pb8 = gpiob.pb8;
+
     loop {
         if let Ok(rgr) = can0_consumer.read() {
             if let Ok(size) = sdcard.write(&mut volume, &mut can0_file, rgr.buf()) {
-                sprintln!("CAN1 wrote {} bytes", size);
+                sprintln!("CAN0 wrote {} bytes", size);
                 rgr.release(size);
             } else {
                 sprintln!("failed to write can0");
@@ -241,7 +281,18 @@ fn entrypoint() -> ! {
             }
         }
 
-        delay.delay_ms(100)
+        match pb8.is_high() {
+            Ok(switch) => {
+                if switch {
+                    buzzer.enable(Channel::CH3);
+                } else if !switch {
+                    buzzer.disable(Channel::CH3);
+                }
+            }
+            Err(err) => sprintln!("failed to read switch {:?}", err),
+        }
+
+        delay.delay_ms(100_u32);
     }
 }
 
