@@ -4,6 +4,7 @@
 pub mod buffer;
 pub mod faces;
 pub mod timestamp;
+pub mod tones;
 
 use core::cell::RefCell;
 use core::ops::DerefMut;
@@ -21,10 +22,11 @@ use embedded_can::Id;
 
 use embedded_sdmmc::VolumeIdx;
 
+use gd32vf103xx_hal::timer::{self, Timer};
 use gd32vf103xx_hal::can::{self, Can, Config, Filter, FilterEntry, FilterMode, FIFO};
 use gd32vf103xx_hal::delay::McycleDelay;
 use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits};
-use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC, TIMER3};
+use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC, TIMER1, TIMER3};
 use gd32vf103xx_hal::prelude::*;
 use gd32vf103xx_hal::pwm::{self, Channel, PwmTimer};
 use gd32vf103xx_hal::rtc::Rtc;
@@ -36,6 +38,14 @@ pub static TIMESTAMP: Mutex<RefCell<Option<Timestamp>>> = Mutex::new(RefCell::ne
 
 pub static CAN0: Mutex<RefCell<Option<Can<CAN0, can::NoRemap>>>> = Mutex::new(RefCell::new(None));
 pub static CAN1: Mutex<RefCell<Option<Can<CAN1, can::Remap1>>>> = Mutex::new(RefCell::new(None));
+
+pub const BUZZER_CHANNEL: Channel = Channel::CH3;
+pub static BUZZER_INDEX: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
+
+pub static BUZZER_TIMER: Mutex<RefCell<Option<PwmTimer<TIMER3, pwm::NoRemap>>>> =
+    Mutex::new(RefCell::new(None));
+pub static BUZZER_TONE_TIMER: Mutex<RefCell<Option<Timer<TIMER1>>>> =
+    Mutex::new(RefCell::new(None));
 
 pub const CAN_FRAME_SIZE: usize = 20;
 pub const CAN_BUFFER_SIZE: usize = 64 * CAN_FRAME_SIZE;
@@ -172,6 +182,33 @@ fn entrypoint() -> ! {
         sprintln!("failed to initialize sdcard! {:?}", error);
     }
 
+    // tone generator
+    sprintln!("setting up buzzer");
+
+    let timer3 = dp.TIMER3;
+
+    let pb9 = gpiob.pb9.into_alternate_push_pull();
+
+    let mut buzzer_timer = PwmTimer::<TIMER3, pwm::NoRemap>::new(
+        timer3,
+        (None, None, None, Some(&pb9)),
+        &mut rcu,
+        &mut afio,
+    );
+
+    let max = buzzer_timer.get_max_duty();
+    buzzer_timer.set_period(500.hz());
+    buzzer_timer.set_duty(BUZZER_CHANNEL, max / 2); // 50% duty cycle
+
+    let mut tone_timer = Timer::<TIMER1>::timer1(dp.TIMER1, 1.hz(), &mut rcu);
+    tone_timer.listen(timer::Event::Update);
+    tone_timer.unlisten(timer::Event::Update);
+
+    sprintln!("setting up switch");
+
+    // switch
+    let pb8 = gpiob.pb8;
+
     // interrupts
     sprintln!("setting up interrupts");
 
@@ -184,11 +221,12 @@ fn entrypoint() -> ! {
         ECLIC::unmask(Interrupt::CAN0_RX1);
         ECLIC::unmask(Interrupt::CAN1_RX0);
         ECLIC::unmask(Interrupt::CAN1_RX1);
+        ECLIC::unmask(Interrupt::TIMER1);
     };
 
     unsafe { riscv::interrupt::enable() };
 
-    // All hardware is now initialized, so let's do preliminary checks.
+    // ---
 
     sprintln!("setting up global resources and buffers");
 
@@ -198,6 +236,8 @@ fn entrypoint() -> ! {
         TIMESTAMP.borrow(cs).replace(Some(timestamp));
         CAN0.borrow(cs).replace(Some(can0));
         CAN1.borrow(cs).replace(Some(can1));
+        BUZZER_TIMER.borrow(cs).replace(Some(buzzer_timer));
+        BUZZER_TONE_TIMER.borrow(cs).replace(Some(tone_timer));
         CAN0_PRODUCER.borrow(cs).replace(Some(can0_producer));
         CAN1_PRODUCER.borrow(cs).replace(Some(can1_producer));
     });
@@ -240,26 +280,7 @@ fn entrypoint() -> ! {
         sdcard.write(&mut volume, &mut can1_file, &header).unwrap();
     }
 
-    sprintln!("setting up buzzer");
-
-    let timer3 = dp.TIMER3;
-
-    let pb9 = gpiob.pb9.into_alternate_push_pull();
-
-    let mut buzzer = PwmTimer::<TIMER3, pwm::NoRemap>::new(
-        timer3,
-        (None, None, None, Some(&pb9)),
-        &mut rcu,
-        &mut afio,
-    );
-
-    let max = buzzer.get_max_duty();
-    buzzer.set_period(500.hz());
-    buzzer.set_duty(Channel::CH3, max / 2); // 50% duty cycle
-
-    sprintln!("setting up switch");
-
-    let pb8 = gpiob.pb8;
+    sprintln!("entering main loop!");
 
     loop {
         if let Ok(rgr) = can0_consumer.read() {
@@ -284,9 +305,7 @@ fn entrypoint() -> ! {
         match pb8.is_high() {
             Ok(switch) => {
                 if switch {
-                    buzzer.enable(Channel::CH3);
-                } else if !switch {
-                    buzzer.disable(Channel::CH3);
+                    sprintln!("switch is high");
                 }
             }
             Err(err) => sprintln!("failed to read switch {:?}", err),
@@ -294,6 +313,36 @@ fn entrypoint() -> ! {
 
         delay.delay_ms(100_u32);
     }
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+fn TIMER1() {
+    riscv::interrupt::free(|cs| {
+        if let (Some(buzzer_timer), Some(buzzer_tone_timer), buzzer_index) = (
+            BUZZER_TIMER.borrow(cs).borrow_mut().as_mut(),
+            BUZZER_TONE_TIMER.borrow(cs).borrow_mut().as_mut(),
+            BUZZER_INDEX.borrow(cs).borrow_mut().deref_mut(),
+        ) {
+            buzzer_tone_timer.clear_update_interrupt_flag();
+            *buzzer_index = (*buzzer_index + 1) % tones::MARIO.len();
+
+            let frequency = tones::MARIO[*buzzer_index].0 << 2;
+            if frequency == 0 {
+                buzzer_timer.disable(BUZZER_CHANNEL);
+            } else {
+                buzzer_timer.enable(BUZZER_CHANNEL);
+                buzzer_timer.set_period(frequency.hz());
+            }
+
+            let frequency = (1000. / (tones::MARIO[*buzzer_index].1) as f32) as u32;
+            if frequency > 0 {
+                buzzer_tone_timer.start(frequency.hz());
+            } else {
+                buzzer_tone_timer.start(1.hz());
+            }
+        }
+    });
 }
 
 #[allow(non_snake_case)]

@@ -1,0 +1,3 @@
+(sym_lib_table
+  (lib (name Telemetry)(type Legacy)(uri ${KIPRJMOD}/Telemetry.lib)(options "")(descr ""))
+)
