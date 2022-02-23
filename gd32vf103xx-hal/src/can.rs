@@ -34,11 +34,14 @@ pub struct Config {
     pub time_segment_2: TQ,
 }
 
+// 3 3 14 2 -- Quasi
+// 3 3 14 1 -- DIOCA!
+
 impl Default for Config {
     fn default() -> Config {
         Config {
             // 1 MBps
-            prescaler: 6,
+            prescaler: 3,
             auto_bus_off_recovery: false,
             auto_retransmission: false,
             auto_wake_up: false,
@@ -47,9 +50,9 @@ impl Default for Config {
             trans_fifo_order: false,
             silent_communication: false,
             loopback_communication: false,
-            resync_jump_width: TQ(1),
-            time_segment_1: TQ(15),
-            time_segment_2: TQ(2),
+            resync_jump_width: TQ(2),
+            time_segment_1: TQ(14),
+            time_segment_2: TQ(1),
         }
     }
 }

@@ -1,4 +1,4 @@
-use gd32vf103xx_hal::{rcu::Clocks};
+use gd32vf103xx_hal::rcu::Clocks;
 
 pub struct Timestamp {
     starting_time: u64,
@@ -14,10 +14,12 @@ impl Timestamp {
     }
 
     pub fn tick_us(&self) -> u64 {
-        self.starting_time  * 1_000_000 + (riscv::register::mcycle::read64() * 1_000_000) / self.core_frequency
+        self.starting_time * 1_000_000
+            + (riscv::register::mcycle::read64() * 1_000_000) / self.core_frequency
     }
 
     pub fn tick_ms(&self) -> u64 {
-        self.starting_time  * 1_000 + (riscv::register::mcycle::read64() * 1_000) / self.core_frequency
+        self.starting_time * 1_000
+            + (riscv::register::mcycle::read64() * 1_000) / self.core_frequency
     }
 }
