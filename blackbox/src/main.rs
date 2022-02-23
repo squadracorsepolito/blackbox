@@ -102,7 +102,7 @@ fn entrypoint() -> ! {
         &mut rcu,
     );
 
-    sprintln!("-= telemetry =-");
+    sprintln!("-= blackbox =-");
 
     // rtc
     let mut backup_domain = dp.BKP.configure(&mut rcu, &mut dp.PMU);

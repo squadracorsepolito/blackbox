@@ -1,4 +1,4 @@
-# `telemetry`
+# `blackbox`
 
 > Board support crate for the Longan Nano board
 
@@ -17,7 +17,7 @@ riscv-openocd -f sipeed-jtag.cfg -f openocd.cfg
 On another terminal window, run cankong in a gdb session:
 
 ```
-cargo run -p telemetry --release
+cargo run -p blackbox --release
 ```
 
 The software should start executing on the longan-nano.
