@@ -7,19 +7,25 @@ pub mod timestamp;
 pub mod tones;
 
 use core::cell::RefCell;
-use core::ops::DerefMut;
+use core::fmt::Write;
+use core::ops::{DerefMut, Sub};
 use core::panic::PanicInfo;
 use core::sync::atomic::{self, Ordering};
-
-use embedded_hal::digital::v2::InputPin;
-
-use timestamp::Timestamp;
 
 use riscv::interrupt::{CriticalSection, Mutex};
 use riscv_rt::entry;
 
 use embedded_can::Id;
-
+use embedded_graphics::image::{Image, ImageRaw};
+use embedded_graphics::mono_font::{self, MonoTextStyleBuilder};
+use embedded_graphics::pixelcolor::raw::LittleEndian;
+use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::{
+    Arc, Circle, Line, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment,
+};
+use embedded_graphics::text::{Alignment, Baseline, Text, TextStyleBuilder};
+use embedded_hal::digital::v2::InputPin;
 use embedded_sdmmc::VolumeIdx;
 
 use gd32vf103xx_hal::can::{self, Can, Config, Filter, FilterEntry, FilterMode, FIFO};
@@ -32,7 +38,11 @@ use gd32vf103xx_hal::rtc::Rtc;
 use gd32vf103xx_hal::timer::{self, Timer};
 
 use longan_nano::hal::pac;
-use longan_nano::{sdcard, sdcard_pins, sprintln};
+use longan_nano::{lcd, lcd_pins, sdcard, sdcard_pins, sprintln};
+
+use timestamp::Timestamp;
+
+use crate::buffer::Buffer;
 
 pub static TIMESTAMP: Mutex<RefCell<Option<Timestamp>>> = Mutex::new(RefCell::new(None));
 
@@ -58,14 +68,7 @@ pub static CAN1_BUFFER: bbqueue::BBBuffer<CAN_BUFFER_SIZE> = bbqueue::BBBuffer::
 pub static CAN1_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, CAN_BUFFER_SIZE>>>> =
     Mutex::new(RefCell::new(None));
 
-#[inline(never)]
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    sprintln!("{}", info);
-    loop {
-        atomic::compiler_fence(Ordering::SeqCst);
-    }
-}
+pub const MARKER_BUFFER: &'static [u8] = &[0; CAN_FRAME_SIZE];
 
 #[entry]
 fn main() -> ! {
@@ -178,10 +181,6 @@ fn entrypoint() -> ! {
     let sdcard_pins = sdcard_pins!(gpiob);
     let mut sdcard = sdcard::configure(dp.SPI1, sdcard_pins, sdcard::SdCardFreq::Safe, &mut rcu);
 
-    if let Err(error) = sdcard.device().init() {
-        sprintln!("failed to initialize sdcard! {:?}", error);
-    }
-
     // tone generator
     sprintln!("setting up buzzer");
 
@@ -206,8 +205,35 @@ fn entrypoint() -> ! {
 
     sprintln!("setting up switch");
 
+    // marker
+    let marker_pin = gpioa.pa8.into_floating_input();
+
     // switch
-    let pb8 = gpiob.pb8;
+    let switch_pin = gpiob.pb8.into_floating_input();
+
+    // lcd
+    let lcd_pins = lcd_pins!(gpioa, gpiob);
+    let mut lcd = lcd::configure(dp.SPI0, lcd_pins, &mut afio, &mut rcu);
+
+    let lcd_text_style_white = MonoTextStyleBuilder::new()
+        .font(&mono_font::ascii::FONT_6X10)
+        .text_color(Rgb565::WHITE)
+        .background_color(Rgb565::BLACK)
+        .build();
+
+    let lcd_text_style_red = MonoTextStyleBuilder::new()
+        .font(&mono_font::ascii::FONT_6X10)
+        .text_color(Rgb565::RED)
+        .background_color(Rgb565::BLACK)
+        .build();
+
+    let lcd_text_style_big = MonoTextStyleBuilder::new()
+        .font(&mono_font::ascii::FONT_9X18_BOLD)
+        .text_color(Rgb565::YELLOW)
+        .background_color(Rgb565::BLACK)
+        .build();
+
+    lcd.clear(Rgb565::BLACK).unwrap();
 
     // interrupts
     sprintln!("setting up interrupts");
@@ -239,6 +265,20 @@ fn entrypoint() -> ! {
         CAN0_PRODUCER.borrow(cs).replace(Some(can0_producer));
         CAN1_PRODUCER.borrow(cs).replace(Some(can1_producer));
     });
+
+    sprintln!("setting up sdcard");
+
+    if let Err(error) = sdcard.device().init() {
+        Text::with_alignment(
+            "ERROR!\nSD Card not initialized",
+            lcd.bounding_box().center(),
+            lcd_text_style_red,
+            Alignment::Center,
+        )
+        .draw(&mut lcd)
+        .unwrap();
+        panic!("failed to initialize sdcard! {:?}", error);
+    }
 
     sprintln!("setting up sdcard volumes");
 
@@ -280,7 +320,8 @@ fn entrypoint() -> ! {
 
     sprintln!("entering main loop!");
 
-    let mut enable_log = pb8.is_high().unwrap();
+    // screen info
+    let mut enable_log = switch_pin.is_high().unwrap();
     if enable_log {
         unsafe {
             ECLIC::unmask(Interrupt::CAN0_RX0);
@@ -290,43 +331,74 @@ fn entrypoint() -> ! {
         };
     }
 
+    let mut marker = marker_pin.is_high().unwrap();
+    let mut marker_changed = false;
+
+    let mut lcd_text = [0u8; 20 * 5];
+    let mut lcd_buffer = Buffer::new(&mut lcd_text[..]);
+
+    let sdcard_max_size = sdcard.device().card_size_bytes().unwrap() as usize;
+    let mut sdcard_used_size = (can0_file.length() + can1_file.length()) as usize;
+
+    sprintln!("sdcard capacity: {}", sdcard_max_size);
+    sprintln!("sdcard used size: {}", sdcard_used_size);
+
+    let lcd_size = lcd.size();
+    let (lcd_width, lcd_height) = (lcd_size.width as i32, lcd_size.height as i32);
+
+    let raw_image: ImageRaw<Rgb565, LittleEndian> = ImageRaw::new(&faces::COOL, faces::WIDTH);
+
     loop {
         if let Ok(rgr) = can0_consumer.read() {
             if let Ok(size) = sdcard.write(&mut volume, &mut can0_file, rgr.buf()) {
                 sprintln!("CAN0 wrote {} bytes", size);
                 rgr.release(size);
+                sdcard_used_size += size;
             } else {
-                sprintln!("failed to write can0");
-                panic!();
+                panic!("failed to write can0");
             }
         }
         if let Ok(rgr) = can1_consumer.read() {
             if let Ok(size) = sdcard.write(&mut volume, &mut can1_file, rgr.buf()) {
                 sprintln!("CAN1 wrote {} bytes", size);
                 rgr.release(size);
+                sdcard_used_size += size;
             } else {
-                sprintln!("failed to write can1");
-                panic!();
+                panic!("failed to write can1");
             }
         }
 
-        if !enable_log && pb8.is_high().unwrap() {
+        if marker {
+            if let Ok(size) = sdcard.write(&mut volume, &mut can0_file, MARKER_BUFFER) {
+                sprintln!("Marker!");
+                sdcard_used_size += size;
+            } else {
+                panic!("failed to write can0");
+            }
+            if let Ok(size) = sdcard.write(&mut volume, &mut can1_file, MARKER_BUFFER) {
+                sprintln!("Marker!");
+                sdcard_used_size += size;
+            } else {
+                panic!("failed to write can1");
+            }
+            marker = false;
+            marker_changed = true;
+        }
+
+        if enable_log && !marker && marker_pin.is_high().unwrap() {
+            marker = true;
+            marker_changed = true;
+        }
+
+        if !enable_log && switch_pin.is_high().unwrap() {
             ECLIC::mask(Interrupt::CAN0_RX0);
             ECLIC::mask(Interrupt::CAN0_RX1);
             ECLIC::mask(Interrupt::CAN1_RX0);
             ECLIC::mask(Interrupt::CAN1_RX1);
             enable_log = true;
-            riscv::interrupt::free(|cs| {
-                if let (Some(buzzer_timer), Some(buzzer_tone_timer)) = (
-                    BUZZER_TIMER.borrow(cs).borrow_mut().as_mut(),
-                    BUZZER_TONE_TIMER.borrow(cs).borrow_mut().as_mut(),
-                ) {
-                    buzzer_tone_timer.listen(timer::Event::Update);
-                    buzzer_timer.enable(BUZZER_CHANNEL);
-                }
-            });
+            buzzer_startup();
             sprintln!("logging enabled");
-        } else if enable_log && pb8.is_low().unwrap() {
+        } else if enable_log && switch_pin.is_low().unwrap() {
             unsafe {
                 ECLIC::unmask(Interrupt::CAN0_RX0);
                 ECLIC::unmask(Interrupt::CAN0_RX1);
@@ -334,20 +406,149 @@ fn entrypoint() -> ! {
                 ECLIC::unmask(Interrupt::CAN1_RX1);
             };
             enable_log = false;
-            riscv::interrupt::free(|cs| {
-                if let (Some(buzzer_timer), Some(buzzer_tone_timer)) = (
-                    BUZZER_TIMER.borrow(cs).borrow_mut().as_mut(),
-                    BUZZER_TONE_TIMER.borrow(cs).borrow_mut().as_mut(),
-                ) {
-                    buzzer_tone_timer.unlisten(timer::Event::Update);
-                    buzzer_timer.disable(BUZZER_CHANNEL);
-                }
-            });
             sprintln!("logging disabled");
+        }
+
+        let now = rtc.current_time();
+        let (hours, minutes, seconds) = (now / 3600, (now / 60) % 60, now % 60);
+
+        lcd_buffer.clear();
+        write!(
+            &mut lcd_buffer,
+            "{:0>2}:{:0>2}:{:0>2}",
+            hours, minutes, seconds
+        )
+        .unwrap();
+
+        Text::with_baseline(
+            lcd_buffer.as_str(),
+            Point::new(5, 5),
+            lcd_text_style_white,
+            Baseline::Top,
+        )
+        .draw(&mut lcd)
+        .unwrap();
+
+        if enable_log {
+            Text::with_text_style(
+                "REC",
+                Point::new(lcd_width - 16, 5),
+                lcd_text_style_red,
+                TextStyleBuilder::new()
+                    .alignment(Alignment::Right)
+                    .baseline(Baseline::Top)
+                    .build(),
+            )
+            .draw(&mut lcd)
+            .unwrap();
+
+            Circle::with_center(Point::new(lcd_width - 9, 9), 8)
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
+                .draw(&mut lcd)
+                .unwrap();
+        } else {
+            Rectangle::with_corners(Point::new(100, 0), Point::new(lcd_width, 18))
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                .draw(&mut lcd)
+                .unwrap();
+        }
+
+        Line::new(Point::new(2, 20), Point::new(lcd_width - 2, 20))
+            .into_styled(PrimitiveStyle::with_stroke(Rgb565::WHITE, 1))
+            .draw(&mut lcd)
+            .unwrap();
+
+        if marker_changed {
+            Rectangle::with_corners(Point::new(0, 21), Point::new(lcd_width, lcd_height))
+                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                .draw(&mut lcd)
+                .unwrap();
+            marker_changed = false;
+        }
+
+        if marker {
+            Text::with_alignment(
+                "MARKER",
+                Point::new(lcd_width / 2, (lcd_height / 3) * 2),
+                lcd_text_style_big,
+                Alignment::Center,
+            )
+            .draw(&mut lcd)
+            .unwrap();
+        } else {
+            Image::new(&raw_image, Point::new(10, 45 - faces::HEIGHT as i32 / 2))
+                .draw(&mut lcd)
+                .unwrap();
+
+            let mut sdcard_used_percentage = sdcard_used_size as f32 / sdcard_max_size as f32;
+            if sdcard_used_percentage < 0.01 {
+                sdcard_used_percentage = 0.36
+            }
+
+            let sdcard_usage_arc_sweep = sdcard_used_percentage * 360.0;
+
+            lcd_buffer.clear();
+            write!(&mut lcd_buffer, "{:0>2.0}%", sdcard_used_percentage * 100.).unwrap();
+
+            Text::with_text_style(
+                lcd_buffer.as_str(),
+                Point::new(130, 50),
+                lcd_text_style_white,
+                TextStyleBuilder::new()
+                    .alignment(Alignment::Center)
+                    .baseline(Baseline::Middle)
+                    .build(),
+            )
+            .draw(&mut lcd)
+            .unwrap();
+
+            Arc::new(
+                Point::new(130, 50).sub(Point::new(20, 20)),
+                40,
+                (90.0 + sdcard_usage_arc_sweep).deg(),
+                (360.0 - sdcard_usage_arc_sweep).deg(),
+            )
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .stroke_color(Rgb565::new(10, 10, 10))
+                    .stroke_width(5)
+                    .stroke_alignment(StrokeAlignment::Inside)
+                    .build(),
+            )
+            .draw(&mut lcd)
+            .unwrap();
+
+            Arc::new(
+                Point::new(130, 50).sub(Point::new(20, 20)),
+                40,
+                90.0.deg(),
+                sdcard_usage_arc_sweep.deg(),
+            )
+            .into_styled(
+                PrimitiveStyleBuilder::new()
+                    .stroke_color(Rgb565::BLUE)
+                    .stroke_width(5)
+                    .stroke_alignment(StrokeAlignment::Inside)
+                    .build(),
+            )
+            .draw(&mut lcd)
+            .unwrap();
         }
 
         delay.delay_ms(100_u32);
     }
+}
+
+fn buzzer_startup() {
+    riscv::interrupt::free(|cs| {
+        if let (Some(buzzer_tone_timer), buzzer_index) = (
+            BUZZER_TONE_TIMER.borrow(cs).borrow_mut().as_mut(),
+            BUZZER_INDEX.borrow(cs).borrow_mut().deref_mut(),
+        ) {
+            *buzzer_index = 0;
+            buzzer_tone_timer.listen(timer::Event::Update);
+        }
+    });
 }
 
 #[allow(non_snake_case)]
@@ -360,25 +561,32 @@ fn TIMER1() {
             BUZZER_INDEX.borrow(cs).borrow_mut().deref_mut(),
         ) {
             buzzer_tone_timer.clear_update_interrupt_flag();
-            *buzzer_index = (*buzzer_index + 1) % tones::TETRIS.len();
 
-            let frequency = tones::TETRIS[*buzzer_index].0 << 2;
-            if frequency == 0 {
-                buzzer_timer.disable(BUZZER_CHANNEL);
-            } else {
-                buzzer_timer.enable(BUZZER_CHANNEL);
-                buzzer_timer.set_period(frequency.hz());
-            }
+            *buzzer_index += 1;
+            if *buzzer_index < tones::STARTUP.len() {
+                let frequency = tones::STARTUP[*buzzer_index].0 << 2;
+                if frequency == 0 {
+                    buzzer_timer.disable(BUZZER_CHANNEL);
+                } else {
+                    buzzer_timer.enable(BUZZER_CHANNEL);
+                    buzzer_timer.set_period(frequency.hz());
+                }
 
-            let frequency = (1000. / (tones::TETRIS[*buzzer_index].1) as f32) as u32;
-            if frequency > 0 {
-                buzzer_tone_timer.start(frequency.hz());
+                let frequency = (1000. / (tones::STARTUP[*buzzer_index].1) as f32) as u32;
+                if frequency > 0 {
+                    buzzer_tone_timer.start(frequency.hz());
+                } else {
+                    buzzer_tone_timer.start(1.hz());
+                }
             } else {
-                buzzer_tone_timer.start(1.hz());
+                *buzzer_index = 0;
+                buzzer_tone_timer.unlisten(timer::Event::Update);
             }
         }
     });
 }
+
+// can interrupts
 
 #[allow(non_snake_case)]
 #[no_mangle]
@@ -390,18 +598,6 @@ fn CAN0_RX0() {
 #[no_mangle]
 fn CAN0_RX1() {
     riscv::interrupt::free(can0_rx);
-}
-
-#[allow(non_snake_case)]
-#[no_mangle]
-fn CAN1_RX0() {
-    riscv::interrupt::free(can1_rx);
-}
-
-#[allow(non_snake_case)]
-#[no_mangle]
-fn CAN1_RX1() {
-    riscv::interrupt::free(can1_rx);
 }
 
 fn can0_rx(cs: &CriticalSection) {
@@ -425,6 +621,18 @@ fn can0_rx(cs: &CriticalSection) {
     }
 }
 
+#[allow(non_snake_case)]
+#[no_mangle]
+fn CAN1_RX0() {
+    riscv::interrupt::free(can1_rx);
+}
+
+#[allow(non_snake_case)]
+#[no_mangle]
+fn CAN1_RX1() {
+    riscv::interrupt::free(can1_rx);
+}
+
 fn can1_rx(cs: &CriticalSection) {
     if let (Some(ref mut can1), Some(ref mut producer), Some(ref mut timestamp)) = (
         CAN1.borrow(cs).borrow_mut().deref_mut(),
@@ -446,13 +654,20 @@ fn can1_rx(cs: &CriticalSection) {
     }
 }
 
+#[inline(never)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    sprintln!("{}", info);
+    loop {
+        atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
 /// Handle all unhandled interrupts
 #[allow(non_snake_case)]
 #[no_mangle]
 fn DefaultHandler() {
     let code = riscv::register::mcause::read().code() & 0xFFF;
     let cause = riscv::register::mcause::Exception::from(code);
-
-    sprintln!("default handler: code={}, cause={:?}", code, cause);
-    panic!();
+    panic!("default handler: code={}, cause={:?}", code, cause);
 }

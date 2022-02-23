@@ -3,8 +3,8 @@ from pathlib import Path
 
 LOOK_R = '( ⚆_⚆)'
 LOOK_L = '(☉_☉ )'
-LOOK_R_HAPPY = '( ◕‿◕)'
-LOOK_L_HAPPY = '(◕‿◕ )'
+# LOOK_R_HAPPY = '( ◕‿◕)'
+# LOOK_L_HAPPY = '(◕‿◕ )'
 SLEEP = '(⇀‿‿↼)'
 SLEEP2 = '(≖‿‿≖)'
 AWAKE = '(◕‿‿◕)'
@@ -12,10 +12,10 @@ BORED = '(-__-)'
 INTENSE = '(°▃▃°)'
 COOL = '(⌐■_■)'
 HAPPY = '(•‿‿•)'
-GRATEFUL = '(^‿‿^)'
+# GRATEFUL = '(^‿‿^)'
 EXCITED = '(ᵔ◡◡ᵔ)'
-MOTIVATED = '(☼‿‿☼)'
-DEMOTIVATED = '(≖__≖)'
+# MOTIVATED = '(☼‿‿☼)'
+# DEMOTIVATED = '(≖__≖)'
 SMART = '(✜‿‿✜)'
 LONELY = '(ب__ب)'
 SAD = '(╥☁╥ )'
@@ -23,14 +23,14 @@ ANGRY = "(-_-')"
 FRIEND = '(♥‿‿♥)'
 BROKEN = '(☓‿‿☓)'
 DEBUG = '(#__#)'
-UPLOAD = '(1__0)'
-UPLOAD1 = '(1__1)'
-UPLOAD2 = '(0__1)'
+# UPLOAD = '(1__0)'
+# UPLOAD1 = '(1__1)'
+# UPLOAD2 = '(0__1)'
 
 FACES = {"LOOK_R": LOOK_R,
          "LOOK_L": LOOK_L,
-         "LOOK_R_HAPPY": LOOK_R_HAPPY,
-         "LOOK_L_HAPPY": LOOK_L_HAPPY,
+        #  "LOOK_R_HAPPY": LOOK_R_HAPPY,
+        #  "LOOK_L_HAPPY": LOOK_L_HAPPY,
          "SLEEP": SLEEP,
          "SLEEP2": SLEEP2,
          "AWAKE": AWAKE,
@@ -38,10 +38,10 @@ FACES = {"LOOK_R": LOOK_R,
          "INTENSE": INTENSE,
          "COOL": COOL,
          "HAPPY": HAPPY,
-         "GRATEFUL": GRATEFUL,
+        #  "GRATEFUL": GRATEFUL,
          "EXCITED": EXCITED,
-         "MOTIVATED": MOTIVATED,
-         "DEMOTIVATED": DEMOTIVATED,
+        #  "MOTIVATED": MOTIVATED,
+        #  "DEMOTIVATED": DEMOTIVATED,
          "SMART": SMART,
          "LONELY": LONELY,
          "SAD": SAD,
@@ -49,9 +49,9 @@ FACES = {"LOOK_R": LOOK_R,
          "FRIEND": FRIEND,
          "BROKEN": BROKEN,
          "DEBUG": DEBUG,
-         "UPLOAD": UPLOAD,
-         "UPLOAD1": UPLOAD1,
-         "UPLOAD2": UPLOAD2,
+        #  "UPLOAD": UPLOAD,
+        #  "UPLOAD1": UPLOAD1,
+        #  "UPLOAD2": UPLOAD2,
          }
 
 
@@ -74,11 +74,14 @@ def im_to_raw(im):
 
 unicode_font = ImageFont.truetype("DejaVuSans.ttf", 22)
 
-sizes = [unicode_font.getsize(face) for face in FACES]
-width = max([size[0] for size in sizes])
-height = max([size[1] for size in sizes])
+sizes = [(unicode_font.getsize(face), face) for face in FACES]
+width = max([(size[0], face) for size, face in sizes])
+height = max([(size[1], face) for size, face in sizes])
 
 print(width, height)
+
+width = width[0]
+height = height[0]
 
 out = Path("faces")
 out.mkdir(exist_ok=True)

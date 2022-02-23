@@ -17,7 +17,7 @@ riscv-openocd -f sipeed-jtag.cfg -f openocd.cfg
 On another terminal window, run cankong in a gdb session:
 
 ```
-cargo run -p cankong --release
+cargo run -p telemetry --release
 ```
 
 The software should start executing on the longan-nano.
