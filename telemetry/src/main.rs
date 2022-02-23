@@ -22,7 +22,6 @@ use embedded_can::Id;
 
 use embedded_sdmmc::VolumeIdx;
 
-use gd32vf103xx_hal::timer::{self, Timer};
 use gd32vf103xx_hal::can::{self, Can, Config, Filter, FilterEntry, FilterMode, FIFO};
 use gd32vf103xx_hal::delay::McycleDelay;
 use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits};
@@ -30,6 +29,7 @@ use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC, TIMER1, TIMER3};
 use gd32vf103xx_hal::prelude::*;
 use gd32vf103xx_hal::pwm::{self, Channel, PwmTimer};
 use gd32vf103xx_hal::rtc::Rtc;
+use gd32vf103xx_hal::timer::{self, Timer};
 
 use longan_nano::hal::pac;
 use longan_nano::{sdcard, sdcard_pins, sprintln};
@@ -200,9 +200,9 @@ fn entrypoint() -> ! {
     buzzer_timer.set_period(500.hz());
     buzzer_timer.set_duty(BUZZER_CHANNEL, max / 2); // 50% duty cycle
 
-    let mut tone_timer = Timer::<TIMER1>::timer1(dp.TIMER1, 1.hz(), &mut rcu);
-    tone_timer.listen(timer::Event::Update);
-    tone_timer.unlisten(timer::Event::Update);
+    let mut buzzer_tone_timer = Timer::<TIMER1>::timer1(dp.TIMER1, 1.hz(), &mut rcu);
+    buzzer_tone_timer.listen(timer::Event::Update);
+    buzzer_tone_timer.unlisten(timer::Event::Update);
 
     sprintln!("setting up switch");
 
@@ -216,15 +216,11 @@ fn entrypoint() -> ! {
     ECLIC::set_threshold_level(Level::L0);
     ECLIC::set_level_priority_bits(LevelPriorityBits::L3P1);
 
+    unsafe { riscv::interrupt::enable() };
+
     unsafe {
-        ECLIC::unmask(Interrupt::CAN0_RX0);
-        ECLIC::unmask(Interrupt::CAN0_RX1);
-        ECLIC::unmask(Interrupt::CAN1_RX0);
-        ECLIC::unmask(Interrupt::CAN1_RX1);
         ECLIC::unmask(Interrupt::TIMER1);
     };
-
-    unsafe { riscv::interrupt::enable() };
 
     // ---
 
@@ -237,7 +233,9 @@ fn entrypoint() -> ! {
         CAN0.borrow(cs).replace(Some(can0));
         CAN1.borrow(cs).replace(Some(can1));
         BUZZER_TIMER.borrow(cs).replace(Some(buzzer_timer));
-        BUZZER_TONE_TIMER.borrow(cs).replace(Some(tone_timer));
+        BUZZER_TONE_TIMER
+            .borrow(cs)
+            .replace(Some(buzzer_tone_timer));
         CAN0_PRODUCER.borrow(cs).replace(Some(can0_producer));
         CAN1_PRODUCER.borrow(cs).replace(Some(can1_producer));
     });
@@ -282,6 +280,16 @@ fn entrypoint() -> ! {
 
     sprintln!("entering main loop!");
 
+    let mut enable_log = pb8.is_high().unwrap();
+    if enable_log {
+        unsafe {
+            ECLIC::unmask(Interrupt::CAN0_RX0);
+            ECLIC::unmask(Interrupt::CAN0_RX1);
+            ECLIC::unmask(Interrupt::CAN1_RX0);
+            ECLIC::unmask(Interrupt::CAN1_RX1);
+        };
+    }
+
     loop {
         if let Ok(rgr) = can0_consumer.read() {
             if let Ok(size) = sdcard.write(&mut volume, &mut can0_file, rgr.buf()) {
@@ -302,13 +310,40 @@ fn entrypoint() -> ! {
             }
         }
 
-        match pb8.is_high() {
-            Ok(switch) => {
-                if switch {
-                    sprintln!("switch is high");
+        if !enable_log && pb8.is_high().unwrap() {
+            ECLIC::mask(Interrupt::CAN0_RX0);
+            ECLIC::mask(Interrupt::CAN0_RX1);
+            ECLIC::mask(Interrupt::CAN1_RX0);
+            ECLIC::mask(Interrupt::CAN1_RX1);
+            enable_log = true;
+            riscv::interrupt::free(|cs| {
+                if let (Some(buzzer_timer), Some(buzzer_tone_timer)) = (
+                    BUZZER_TIMER.borrow(cs).borrow_mut().as_mut(),
+                    BUZZER_TONE_TIMER.borrow(cs).borrow_mut().as_mut(),
+                ) {
+                    buzzer_tone_timer.listen(timer::Event::Update);
+                    buzzer_timer.enable(BUZZER_CHANNEL);
                 }
-            }
-            Err(err) => sprintln!("failed to read switch {:?}", err),
+            });
+            sprintln!("logging enabled");
+        } else if enable_log && pb8.is_low().unwrap() {
+            unsafe {
+                ECLIC::unmask(Interrupt::CAN0_RX0);
+                ECLIC::unmask(Interrupt::CAN0_RX1);
+                ECLIC::unmask(Interrupt::CAN1_RX0);
+                ECLIC::unmask(Interrupt::CAN1_RX1);
+            };
+            enable_log = false;
+            riscv::interrupt::free(|cs| {
+                if let (Some(buzzer_timer), Some(buzzer_tone_timer)) = (
+                    BUZZER_TIMER.borrow(cs).borrow_mut().as_mut(),
+                    BUZZER_TONE_TIMER.borrow(cs).borrow_mut().as_mut(),
+                ) {
+                    buzzer_tone_timer.unlisten(timer::Event::Update);
+                    buzzer_timer.disable(BUZZER_CHANNEL);
+                }
+            });
+            sprintln!("logging disabled");
         }
 
         delay.delay_ms(100_u32);
@@ -325,9 +360,9 @@ fn TIMER1() {
             BUZZER_INDEX.borrow(cs).borrow_mut().deref_mut(),
         ) {
             buzzer_tone_timer.clear_update_interrupt_flag();
-            *buzzer_index = (*buzzer_index + 1) % tones::MARIO.len();
+            *buzzer_index = (*buzzer_index + 1) % tones::TETRIS.len();
 
-            let frequency = tones::MARIO[*buzzer_index].0 << 2;
+            let frequency = tones::TETRIS[*buzzer_index].0 << 2;
             if frequency == 0 {
                 buzzer_timer.disable(BUZZER_CHANNEL);
             } else {
@@ -335,7 +370,7 @@ fn TIMER1() {
                 buzzer_timer.set_period(frequency.hz());
             }
 
-            let frequency = (1000. / (tones::MARIO[*buzzer_index].1) as f32) as u32;
+            let frequency = (1000. / (tones::TETRIS[*buzzer_index].1) as f32) as u32;
             if frequency > 0 {
                 buzzer_tone_timer.start(frequency.hz());
             } else {
