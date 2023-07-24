@@ -115,6 +115,7 @@ pub struct Filter {
 pub trait Pins<CAN, REMAP> {
     fn remap(&self) -> REMAP;
 }
+
 macro_rules! can_pin {
     ($can:ty, $($remap:ident: (
         tx:$tx_pin:ident, rx:$rx_pin:ident, $t:ty, $val:expr

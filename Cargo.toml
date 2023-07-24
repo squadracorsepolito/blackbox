@@ -4,6 +4,7 @@ members = [
   "longan-nano",
   "blackbox"
 ]
+resolver = "2"
 
 [profile.release]
 opt-level = "z"  # Optimize for size.

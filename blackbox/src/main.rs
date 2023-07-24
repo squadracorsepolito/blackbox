@@ -11,6 +11,7 @@ use core::sync::atomic::{self, Ordering};
 use embedded_can::Id;
 use critical_section::{CriticalSection, Mutex};
 use embedded_sdmmc::VolumeIdx;
+use longan_nano::led::{rgb, Led};
 use riscv_rt::entry;
 
 use embedded_hal::digital::v2::InputPin;
@@ -19,7 +20,7 @@ use gd32vf103xx_hal::prelude::*;
 use gd32vf103xx_hal::can::{self, Can, Config, Filter, FilterEntry, FilterMode, FIFO};
 use gd32vf103xx_hal::delay::McycleDelay;
 use gd32vf103xx_hal::eclic::{EclicExt, Level, LevelPriorityBits};
-use gd32vf103xx_hal::pac::{Interrupt, CAN0, CAN1, ECLIC};
+use gd32vf103xx_hal::pac::{Interrupt, CAN0, ECLIC};
 use gd32vf103xx_hal::rtc::Rtc;
 
 use longan_nano::hal::pac;
@@ -30,7 +31,6 @@ use timestamp::Timestamp;
 pub static TIMESTAMP: Mutex<RefCell<Option<Timestamp>>> = Mutex::new(RefCell::new(None));
 
 pub static CAN0: Mutex<RefCell<Option<Can<CAN0, can::NoRemap>>>> = Mutex::new(RefCell::new(None));
-pub static CAN1: Mutex<RefCell<Option<Can<CAN1, can::Remap1>>>> = Mutex::new(RefCell::new(None));
 
 pub const CAN_FRAME_SIZE: usize = 20;
 pub const CAN_BUFFER_SIZE: usize = 64 * CAN_FRAME_SIZE;
@@ -39,11 +39,7 @@ pub static CAN0_BUFFER: bbqueue::BBBuffer<CAN_BUFFER_SIZE> = bbqueue::BBBuffer::
 pub static CAN0_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, CAN_BUFFER_SIZE>>>> =
     Mutex::new(RefCell::new(None));
 
-pub static CAN1_BUFFER: bbqueue::BBBuffer<CAN_BUFFER_SIZE> = bbqueue::BBBuffer::new();
-pub static CAN1_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, CAN_BUFFER_SIZE>>>> =
-    Mutex::new(RefCell::new(None));
-
-pub const MARKER_BUFFER: &'static [u8] = &[0; CAN_FRAME_SIZE];
+pub const MARKER_BUFFER: &'static [u8] = &[0xFF; CAN_FRAME_SIZE];
 
 #[entry]
 fn main() -> ! {
@@ -66,6 +62,7 @@ fn entrypoint() -> ! {
 
     let gpioa = dp.GPIOA.split(&mut rcu);
     let gpiob = dp.GPIOB.split(&mut rcu);
+    let gpioc = dp.GPIOC.split(&mut rcu);
 
     // stdout
     longan_nano::stdout::configure(
@@ -77,8 +74,14 @@ fn entrypoint() -> ! {
         &mut rcu,
     );
 
-    sprintln!("-= blackbox =-");
+    sprintln!("-= blackbox by ~pipo =-");
 
+    // leds
+    let (mut red, mut green, mut blue) = rgb(gpioc.pc13, gpioa.pa1, gpioa.pa2);
+    green.off(); // loop led
+    blue.on(); // setup /  input led
+    red.on(); // setup led
+    
     // rtc
     let mut backup_domain = dp.BKP.configure(&mut rcu, &mut dp.PMU);
     let rtc = Rtc::rtc(dp.RTC, &mut backup_domain);
@@ -91,9 +94,6 @@ fn entrypoint() -> ! {
     // can
     let pa12 = gpioa.pa12.into_alternate_push_pull();
     let pa11 = gpioa.pa11.into_floating_input();
-
-    let pb6 = gpiob.pb6.into_alternate_push_pull();
-    let pb5 = gpiob.pb5.into_floating_input();
 
     sprintln!("setting up can0");
 
@@ -123,33 +123,6 @@ fn entrypoint() -> ! {
     can0.enable_interrupt(can::Interrupt::RFFIE0);
     can0.enable_interrupt(can::Interrupt::RFFIE1);
 
-    sprintln!("setting up can1");
-
-    let config = Config::default();
-
-    let mut can1 = Can::<CAN1, can::Remap1>::new(dp.CAN1, (pb6, pb5), config, &mut afio, &mut rcu);
-
-    can1.set_filter(
-        0,
-        Filter {
-            mode: FilterMode::Mask,
-            entry: FilterEntry::Entry32([0, 0]),
-            fifo_index: FIFO::FIFO0,
-        },
-    );
-
-    can1.set_filter(
-        1,
-        Filter {
-            mode: FilterMode::Mask,
-            entry: FilterEntry::Entry32([0, 0]),
-            fifo_index: FIFO::FIFO1,
-        },
-    );
-
-    can1.enable_interrupt(can::Interrupt::RFFIE0);
-    can1.enable_interrupt(can::Interrupt::RFFIE1);
-
     sprintln!("setting up inputs");
 
     // marker
@@ -165,11 +138,8 @@ fn entrypoint() -> ! {
     unsafe { riscv::interrupt::enable() };
 
     unsafe {
-        ECLIC::unmask(Interrupt::TIMER1);
         ECLIC::unmask(Interrupt::CAN0_RX0);
         ECLIC::unmask(Interrupt::CAN0_RX1);
-        ECLIC::unmask(Interrupt::CAN1_RX0);
-        ECLIC::unmask(Interrupt::CAN1_RX1);
     };
 
     sprintln!("setting up sdcard");
@@ -200,40 +170,26 @@ fn entrypoint() -> ! {
         )
         .unwrap();
 
-    sprintln!("setting up sdcard CAN1 log");
-
     if can0_file.length() == 0 {
         sdcard.write(&mut volume, &mut can0_file, &header).unwrap();
     }
 
-    let mut can1_file = sdcard
-        .open_file_in_dir(
-            &mut volume,
-            &root_dir,
-            "CAN1",
-            embedded_sdmmc::Mode::ReadWriteCreateOrAppend,
-        )
-        .unwrap();
-
-    if can1_file.length() == 0 {
-        sdcard.write(&mut volume, &mut can1_file, &header).unwrap();
-    }
-
-    let mut marker_one_time = false;
-
     sprintln!("setting up global resources and buffers");
 
     let (can0_producer, mut can0_consumer) = CAN0_BUFFER.try_split().unwrap();
-    let (can1_producer, mut can1_consumer) = CAN1_BUFFER.try_split().unwrap();
     critical_section::with(|cs| {
         TIMESTAMP.borrow(cs).replace(Some(timestamp));
         CAN0.borrow(cs).replace(Some(can0));
-        CAN1.borrow(cs).replace(Some(can1));
         CAN0_PRODUCER.borrow(cs).replace(Some(can0_producer));
-        CAN1_PRODUCER.borrow(cs).replace(Some(can1_producer));
     });
 
     sprintln!("entering main loop");
+
+    let mut marker_one_time = false;
+
+    // turn off setup leds
+    blue.off();
+    red.off();
 
     loop {
         if let Ok(rgr) = can0_consumer.read() {
@@ -242,24 +198,25 @@ fn entrypoint() -> ! {
                 .expect("failed to write can0");
             rgr.release(size);
         }
-        if let Ok(rgr) = can1_consumer.read() {
-            let size = sdcard
-                .write(&mut volume, &mut can1_file, rgr.buf())
-                .expect("failed to write can1");
-            rgr.release(size);
-        }
 
-        if marker_pin.is_high().unwrap() && !marker_one_time {
-            sprintln!("Marker!");
-            sdcard
-                .write(&mut volume, &mut can0_file, MARKER_BUFFER)
-                .expect("failed to write to can0");
-            sdcard
-                .write(&mut volume, &mut can1_file, MARKER_BUFFER)
-                .expect("failed to write to can1");
+        if marker_pin.is_high().unwrap() {
+            if marker_one_time {
+                sprintln!("Marker!");
+                sdcard
+                    .write(&mut volume, &mut can0_file, MARKER_BUFFER)
+                    .expect("failed to write to can0");
+                blue.on();
+            }
             marker_one_time = true;
         } else {
+            blue.off();
             marker_one_time = false;
+        }
+
+        if green.is_on() {
+            green.off()
+        } else {
+            green.on()
         }
 
         delay.delay_ms(100_u32);
@@ -285,39 +242,6 @@ fn can0_rx(cs: CriticalSection) {
         TIMESTAMP.borrow(cs).borrow_mut().deref_mut(),
     ) {
         let frame = nb::block!(can0.receive()).unwrap();
-        let time: [u8; 8] = timestamp.tick_us().to_ne_bytes();
-        let id: [u8; 4] = match frame.id {
-            Id::Standard(id) => (id.as_raw() as u32).to_ne_bytes(),
-            Id::Extended(id) => id.as_raw().to_ne_bytes(),
-        };
-        let data: [u8; 8] = frame.data;
-        let mut wrg = producer.grant_exact(CAN_FRAME_SIZE).unwrap();
-        wrg.buf()[..8].copy_from_slice(&time);
-        wrg.buf()[8..12].copy_from_slice(&id);
-        wrg.buf()[12..20].copy_from_slice(&data);
-        wrg.commit(CAN_FRAME_SIZE);
-    }
-}
-
-#[allow(non_snake_case)]
-#[no_mangle]
-fn CAN1_RX0() {
-    critical_section::with(can1_rx);
-}
-
-#[allow(non_snake_case)]
-#[no_mangle]
-fn CAN1_RX1() {
-    critical_section::with(can1_rx);
-}
-
-fn can1_rx(cs: CriticalSection) {
-    if let (Some(ref mut can1), Some(ref mut producer), Some(ref mut timestamp)) = (
-        CAN1.borrow(cs).borrow_mut().deref_mut(),
-        CAN1_PRODUCER.borrow(cs).borrow_mut().deref_mut(),
-        TIMESTAMP.borrow(cs).borrow_mut().deref_mut(),
-    ) {
-        let frame = nb::block!(can1.receive()).unwrap();
         let time: [u8; 8] = timestamp.tick_us().to_ne_bytes();
         let id: [u8; 4] = match frame.id {
             Id::Standard(id) => (id.as_raw() as u32).to_ne_bytes(),
