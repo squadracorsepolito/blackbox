@@ -1,0 +1,27 @@
+[package]
+name = "longan-nano"
+version = "0.3.0"
+authors = ["Vadim Kaushan <admin@disasm.info>"]
+repository = "https://github.com/riscv-rust/longan-nano"
+categories = ["embedded", "hardware-support", "no-std"]
+description = "Board support package for the Longan Nano board"
+keywords = ["riscv", "gd32", "bsp"]
+license = "ISC"
+edition = "2018"
+
+[package.metadata.docs.rs]
+features = ['lcd']
+rustdoc-args = ["--cfg", "docsrs"]
+default-target = "x86_64-unknown-linux-gnu"
+
+[dependencies]
+gd32vf103xx-hal = { path = "../gd32vf103xx-hal" }
+embedded-hal = "0.2.6"
+nb = "1.0.0"
+riscv = "0.10.1"
+st7735-lcd = { version = "0.8.1", optional = true }
+embedded-sdmmc = { version = "0.3.0", optional = true }
+
+[features]
+lcd = ["st7735-lcd"]
+sdcard = ["embedded-sdmmc"]
