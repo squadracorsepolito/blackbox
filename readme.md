@@ -1,7 +1,5 @@
 # `blackbox`
 
-> Board support crate for the Longan Nano board
-
 ## Getting started
 
 Follow the documentation in the [longan-nano](./longan-nano/readme.md) crate.
